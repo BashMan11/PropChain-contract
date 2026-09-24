@@ -28,10 +28,13 @@ pub mod propchain_fees {
     const CONGESTION_WINDOW: u32 = 100;
     /// Max fee multiplier from congestion (e.g. 3x base)
     const MAX_CONGESTION_MULTIPLIER: u32 = 300; // 300% of base
+    /// Length of a congestion window in seconds before it rolls over.
+    const CONGESTION_WINDOW_SECS: u64 = 3600; // 1 hour
 
     include!("types.rs");
     include!("errors.rs");
     include!("strategies.rs");
+    include!("rounding.rs");
 
     #[ink(storage)]
     pub struct FeeManager {
@@ -194,24 +197,48 @@ pub mod propchain_fees {
                 .unwrap_or(self.default_config.clone())
         }
 
-        /// Compute current congestion index (0-100) from recent activity
+        /// True once the current congestion window has fully elapsed.
+        fn congestion_window_elapsed(&self, now: u64) -> bool {
+            now.saturating_sub(self.last_congestion_reset) >= CONGESTION_WINDOW_SECS
+        }
+
+        /// Roll the congestion window over once it has fully elapsed: the
+        /// window restarts from `now` with a fresh (empty) operation count.
+        ///
+        /// This is the single place that mutates `last_congestion_reset`, so
+        /// pricing and fee recording always share one notion of the window
+        /// (Issue #1121). It is called from every mutating path that prices
+        /// against congestion so an idle tail cannot leave the window stale.
+        fn rollover_congestion(&mut self) {
+            let now = self.env().block_timestamp();
+            if self.congestion_window_elapsed(now) {
+                self.last_congestion_reset = now;
+                self.recent_ops_count = 0;
+            }
+        }
+
+        /// Compute current congestion index (0-100) from recent activity.
+        /// A rolled-over (empty) window reports 0 congestion.
         fn congestion_index(&self) -> u32 {
             let now = self.env().block_timestamp();
-            let window_secs = 3600u64; // 1 hour window
-            if now.saturating_sub(self.last_congestion_reset) > window_secs {
-                return 0; // Reset after window
-            }
-            let count = self.recent_ops_count;
+            let count = if self.congestion_window_elapsed(now) {
+                0
+            } else {
+                self.recent_ops_count
+            };
             // Normalize to 0-100: CONGESTION_WINDOW ops = 100
             (count.saturating_mul(100).saturating_div(CONGESTION_WINDOW)).min(100)
         }
 
-        /// Demand factor in basis points (from recent volume)
+        /// Demand factor in basis points.
+        ///
+        /// Returns the configured demand factor directly as the additive
+        /// market-demand component of the fee model. It deliberately does NOT
+        /// scale itself by the congestion index: congestion is already applied
+        /// by the dynamic strategy from the same `recent_ops_count`, so
+        /// scaling here would double-count recent volume (Issue #1121).
         fn demand_factor_bp(&self) -> BasisPoints {
-            let ci = self.congestion_index();
-            let demand_factor = self.default_config.demand_factor_bp.get();
-            let new_demand_factor = demand_factor.saturating_mul(ci).saturating_div(100);
-            BasisPoints::new(new_demand_factor)
+            self.default_config.demand_factor_bp
         }
 
         // ========== Dynamic fee calculation ==========
@@ -261,15 +288,13 @@ pub mod propchain_fees {
         ) -> Result<(), FeeError> {
             self.ensure_admin()?;
             let _ = from;
+            // Roll the window over first so the increment below is attributed
+            // to a fresh window (shared rollover — `rollover_congestion`).
+            self.rollover_congestion();
             self.recent_ops_count = self
                 .recent_ops_count
                 .saturating_add(1)
                 .min(CONGESTION_WINDOW);
-            let now = self.env().block_timestamp();
-            if now.saturating_sub(self.last_congestion_reset) > 3600 {
-                self.last_congestion_reset = now;
-                self.recent_ops_count = 1;
-            }
             self.fee_treasury = self.fee_treasury.saturating_add(amount);
             self.total_fees_collected = self.total_fees_collected.saturating_add(amount);
             Ok(())
@@ -281,6 +306,10 @@ pub mod propchain_fees {
         #[ink(message)]
         pub fn update_fee_params(&mut self) -> Result<(), FeeError> {
             self.ensure_admin()?;
+            // Roll the congestion window so the fee parameters are derived from
+            // the current window even when no new fee records arrived during
+            // the window's tail (Issue #1121).
+            self.rollover_congestion();
             let now = self.env().block_timestamp();
             let congestion = self.congestion_index();
             let mut config = self.default_config.clone();
@@ -556,7 +585,15 @@ pub mod propchain_fees {
             Ok(())
         }
 
-        /// Distribute accumulated fees: validator share to validators, rest to treasury
+        /// Distribute accumulated fees: validator share to validators, rest to treasury.
+        ///
+        /// Dispersals round down (never over-pay a participant): the validator
+        /// share uses floor basis-point math and the per-validator split
+        /// truncates. Everything that is not paid out — the treasury share plus
+        /// the integer-division remainder — stays in `fee_treasury` and is
+        /// carried forward to the next distribution instead of being dropped
+        /// (Issue #1120). Invariant: after a distribution,
+        /// `sum(distributed to validators) + fee_treasury == fee_treasury before`.
         #[ink(message)]
         pub fn distribute_fees(&mut self) -> Result<(), FeeError> {
             self.ensure_admin()?;
@@ -567,8 +604,10 @@ pub mod propchain_fees {
             let validator_total = self.validator_share_bp.mul_floor(amount);
             let validator_list = self.validator_list.clone();
             let validator_count = validator_list.len() as u32;
+            let mut paid_out = 0u128;
             if validator_count > 0 && validator_total > 0 {
                 let per_validator = validator_total.saturating_div(validator_count as u128);
+                paid_out = per_validator.saturating_mul(validator_count as u128);
                 for acc in validator_list {
                     let current = self.pending_rewards.get(acc).unwrap_or(0);
                     self.pending_rewards
@@ -583,7 +622,9 @@ pub mod propchain_fees {
                     });
                 }
             }
-            self.fee_treasury = 0;
+            // Carry the treasury share and the division remainder forward; the
+            // remainder would otherwise be lost when the treasury is zeroed.
+            self.fee_treasury = amount.saturating_sub(paid_out);
             Ok(())
         }
 

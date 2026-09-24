@@ -26,6 +26,7 @@ pub mod governance {
     use ink::storage::Mapping;
     use propchain_traits::constants;
     use propchain_traits::errors::*;
+    use super::treasury;
 
     include!("errors.rs");
     include!("types.rs");
@@ -119,6 +120,35 @@ pub mod governance {
         pub admin: AccountId,
     }
 
+    /// Emitted when the treasury is funded (Issue #1122).
+    #[ink(event)]
+    pub struct TreasuryFunded {
+        #[ink(topic)]
+        pub by: AccountId,
+        pub amount: u128,
+        pub timestamp: u64,
+    }
+
+    /// Emitted when an executed budget proposal disburses funds (Issue #1122).
+    #[ink(event)]
+    pub struct TreasuryReleased {
+        #[ink(topic)]
+        pub proposal_id: u64,
+        #[ink(topic)]
+        pub recipient: AccountId,
+        pub amount: u128,
+        pub at: u64,
+    }
+
+    /// Emitted when the admin updates the treasury spend limit (Issue #1122).
+    #[ink(event)]
+    pub struct TreasurySpendLimitUpdated {
+        pub old_limit: u128,
+        pub new_limit: u128,
+        #[ink(topic)]
+        pub by: AccountId,
+    }
+
     /// Emitted when auto-execute is toggled for a proposal.
     #[ink(event)]
     pub struct AutoExecuteToggled {
@@ -207,6 +237,11 @@ pub mod governance {
         // ── Discussion Forum (Issue #233) ───────────────────────────────────────
         /// Comments/discussion for each proposal
         proposal_comments: Mapping<u64, Vec<DiscussionComment>>,
+        // ── Treasury (Issue #1122) ──────────────────────────────────────────────
+        /// Governable treasury: holds deposited funds and enforces a spend limit.
+        treasury: treasury::Treasury,
+        /// Requested disbursement per budget proposal: proposal_id -> amount.
+        proposal_payouts: Mapping<u64, u128>,
     }
 
     // =========================================================================
@@ -253,6 +288,8 @@ pub mod governance {
                 reveal_phase_started: Mapping::default(),
                 reveal_phase_duration: 10_800, // ~18 hours at 6s blocks
                 proposal_comments: Mapping::default(),
+                treasury: treasury::Treasury::new(0, 0),
+                proposal_payouts: Mapping::default(),
             }
         }
 
@@ -652,6 +689,11 @@ pub mod governance {
                 return Err(Error::TimelockActive);
             }
 
+            // Route any treasury payout BEFORE marking the proposal executed,
+            // so a spend-limit or funding denial leaves it still approvable
+            // (Issue #1122).
+            self.release_proposal_funds(proposal_id)?;
+
             self.apply_status_transition(&mut proposal, ProposalStatus::Executed);
             proposal.executed_at = now;
             self.proposals.insert(proposal_id, &proposal);
@@ -899,6 +941,9 @@ pub mod governance {
 
             let now = self.env().block_number() as u64;
             if execute {
+                // Force-execution disburses any budget payout too; a denial
+                // (spend limit / funds) aborts the override (Issue #1122).
+                self.release_proposal_funds(proposal_id)?;
                 self.apply_status_transition(&mut proposal, ProposalStatus::Executed);
                 proposal.executed_at = now;
             } else {
@@ -982,6 +1027,117 @@ pub mod governance {
             Ok(())
         }
 
+        // ----- Treasury (Issue #1122) -----
+
+        /// Funds the governance treasury with the value attached to the call.
+        ///
+        /// Payable; the attached value must be non-zero (`Error::InvalidAmount`
+        /// otherwise). Disbursements are driven by executed budget proposals
+        /// and bounded by the spend limit.
+        #[ink(message, payable)]
+        pub fn fund_treasury(&mut self) -> Result<u128, Error> {
+            let amount = self.env().transferred_value();
+            if amount == 0 {
+                return Err(Error::InvalidAmount);
+            }
+            self.treasury.deposit(amount);
+            self.env().emit_event(TreasuryFunded {
+                by: self.env().caller(),
+                amount,
+                timestamp: self.env().block_timestamp(),
+            });
+            Ok(self.treasury.balance())
+        }
+
+        /// Sets the maximum amount a single executed budget proposal may release.
+        /// Admin only (Issue #1122).
+        #[ink(message)]
+        pub fn set_treasury_spend_limit(&mut self, new_limit: u128) -> Result<(), Error> {
+            self.ensure_admin()?;
+            let old_limit = self.treasury.spend_limit();
+            self.treasury.set_spend_limit(new_limit);
+            self.env().emit_event(TreasurySpendLimitUpdated {
+                old_limit,
+                new_limit,
+                by: self.env().caller(),
+            });
+            Ok(())
+        }
+
+        /// Creates a budget proposal requesting `amount` for `target`.
+        ///
+        /// Signers only; `amount` must be non-zero. On execution the amount is
+        /// released from the treasury to `target` (bounded by the spend limit).
+        #[ink(message)]
+        pub fn create_budget_proposal(
+            &mut self,
+            description_hash: Hash,
+            target: AccountId,
+            amount: u128,
+        ) -> Result<u64, Error> {
+            let caller = self.env().caller();
+            self.ensure_signer(caller)?;
+
+            if amount == 0 {
+                return Err(Error::InvalidAmount);
+            }
+
+            if self.active_proposal_count >= constants::GOVERNANCE_MAX_ACTIVE_PROPOSALS {
+                return Err(Error::MaxProposals);
+            }
+
+            let proposal_id = self.proposal_counter;
+            self.proposal_counter = self.proposal_counter.saturating_add(1);
+            let now = self.env().block_number() as u64;
+
+            let proposal = GovernanceProposal {
+                id: proposal_id,
+                proposer: caller,
+                description_hash,
+                action_type: GovernanceAction::BudgetSpend,
+                target: Some(target),
+                threshold: self.threshold,
+                votes_for: 0,
+                votes_against: 0,
+                status: ProposalStatus::Active,
+                created_at: now,
+                executed_at: 0,
+                timelock_until: 0,
+                is_emergency: false,
+            };
+
+            self.proposals.insert(proposal_id, &proposal);
+            self.proposal_payouts.insert(proposal_id, &amount);
+            self.active_proposal_count = self.active_proposal_count.saturating_add(1);
+
+            self.env().emit_event(ProposalCreated {
+                proposal_id,
+                proposer: caller,
+                action_type: GovernanceAction::BudgetSpend,
+                threshold: self.threshold,
+            });
+
+            Ok(proposal_id)
+        }
+
+        /// Returns the treasury balance (Issue #1122).
+        #[ink(message)]
+        pub fn get_treasury_balance(&self) -> u128 {
+            self.treasury.balance()
+        }
+
+        /// Returns the treasury spend limit (Issue #1122).
+        #[ink(message)]
+        pub fn get_treasury_spend_limit(&self) -> u128 {
+            self.treasury.spend_limit()
+        }
+
+        /// Returns the requested payout for a budget proposal, if any.
+        #[ink(message)]
+        pub fn get_proposal_payout(&self, proposal_id: u64) -> Option<u128> {
+            self.proposal_payouts.get(proposal_id)
+        }
+
         // ----- Internal helpers -----
 
         fn ensure_admin(&self) -> Result<(), Error> {
@@ -995,6 +1151,50 @@ pub mod governance {
             if !self.signers.contains(&account) {
                 return Err(Error::NotASigner);
             }
+            Ok(())
+        }
+
+        /// Maps a standalone `TreasuryError` onto the contract error surface.
+        fn map_treasury_error(e: treasury::TreasuryError) -> Error {
+            match e {
+                treasury::TreasuryError::NotApproved => Error::ProposalClosed,
+                treasury::TreasuryError::ExceedsSpendLimit => Error::ExceedsSpendLimit,
+                treasury::TreasuryError::InsufficientFunds => Error::InsufficientTreasuryFunds,
+            }
+        }
+
+        /// Disburses a budget proposal's payout (Issue #1122).
+        ///
+        /// No-op for proposals without a payout. Feasibility is checked
+        /// against the spend limit and balance *before* the native transfer,
+        /// so a denial leaves the ledger and the proposal untouched.
+        fn release_proposal_funds(&mut self, proposal_id: u64) -> Result<(), Error> {
+            let payout = match self.proposal_payouts.get(proposal_id) {
+                Some(p) if p > 0 => p,
+                _ => return Ok(()),
+            };
+            let proposal = self
+                .proposals
+                .get(proposal_id)
+                .ok_or(Error::ProposalNotFound)?;
+            let target = proposal.target.ok_or(Error::ProposalNotFound)?;
+
+            self.treasury
+                .can_release(true, payout)
+                .map_err(Self::map_treasury_error)?;
+            if self.env().transfer(target, payout).is_err() {
+                return Err(Error::TransferFailed);
+            }
+            self.treasury
+                .release(true, payout)
+                .map_err(Self::map_treasury_error)?;
+
+            self.env().emit_event(TreasuryReleased {
+                proposal_id,
+                recipient: target,
+                amount: payout,
+                at: self.env().block_timestamp(),
+            });
             Ok(())
         }
 

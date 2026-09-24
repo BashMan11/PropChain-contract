@@ -18,6 +18,14 @@ pub enum Error {
     ProposalExpired,
     /// Signer roster changes are blocked while proposals are actively voting.
     SignerChangesLocked,
+    /// A treasury disbursement exceeds the spend limit (Issue #1122).
+    ExceedsSpendLimit,
+    /// The treasury does not hold enough funds for the disbursement (Issue #1122).
+    InsufficientTreasuryFunds,
+    /// The proposed amount is zero or otherwise unusable (Issue #1122).
+    InvalidAmount,
+    /// The native transfer for a treasury disbursement failed (Issue #1122).
+    TransferFailed,
 }
 
 impl core::fmt::Display for Error {
@@ -39,6 +47,12 @@ impl core::fmt::Display for Error {
             Error::SignerChangesLocked => {
                 write!(f, "Signer roster is locked while proposals are actively voting")
             }
+            Error::ExceedsSpendLimit => write!(f, "Disbursement exceeds the treasury spend limit"),
+            Error::InsufficientTreasuryFunds => {
+                write!(f, "Treasury funds are insufficient for this disbursement")
+            }
+            Error::InvalidAmount => write!(f, "The requested amount is invalid"),
+            Error::TransferFailed => write!(f, "Transfer of treasury funds failed"),
         }
     }
 }
@@ -60,6 +74,12 @@ impl ContractError for Error {
             Error::NotASigner => governance_codes::GOVERNANCE_NOT_A_SIGNER,
             Error::ProposalExpired => governance_codes::GOVERNANCE_PROPOSAL_EXPIRED,
             Error::SignerChangesLocked => governance_codes::GOVERNANCE_SIGNER_CHANGES_LOCKED,
+            Error::ExceedsSpendLimit => governance_codes::GOVERNANCE_EXCEEDS_SPEND_LIMIT,
+            Error::InsufficientTreasuryFunds => {
+                governance_codes::GOVERNANCE_INSUFFICIENT_TREASURY_FUNDS
+            }
+            Error::InvalidAmount => governance_codes::GOVERNANCE_INVALID_AMOUNT,
+            Error::TransferFailed => governance_codes::GOVERNANCE_TRANSFER_FAILED,
         }
     }
 
@@ -81,6 +101,12 @@ impl ContractError for Error {
             Error::SignerChangesLocked => {
                 "Signer roster is locked while proposals are actively voting"
             }
+            Error::ExceedsSpendLimit => "Disbursement exceeds the treasury spend limit",
+            Error::InsufficientTreasuryFunds => {
+                "Treasury funds are insufficient for this disbursement"
+            }
+            Error::InvalidAmount => "The requested amount is invalid",
+            Error::TransferFailed => "Transfer of treasury funds failed",
         }
     }
 

@@ -344,7 +344,17 @@ mod fee_tests {
         // default config, and the fee must come from the default strategy.
         assert_eq!(contract.get_config(FeeOperation::TransferProperty), default);
         let fee = contract.calculate_fee(FeeOperation::TransferProperty);
-        assert_eq!(fee, FeeCalculator::calculate(&default, &strategy_context(0, FeeOperation::TransferProperty)));
+        // The expected model uses the contract's own demand factor (single
+        // source of congestion — Issue #1121), not a zero-demand context.
+        let expected = FeeCalculator::calculate(
+            &default,
+            &FeeContext {
+                congestion_index: 0,
+                demand_factor_bp: contract.demand_factor_bp(),
+                operation: FeeOperation::TransferProperty,
+            },
+        );
+        assert_eq!(fee, expected);
     }
 
 
@@ -726,6 +736,117 @@ mod fee_tests {
                 }
             ),
             "default dynamic fee rate (== reference) must not alter the fee"
+    // ========== Fee rounding (Issue #1119) ==========
+
+    /// Collection fees are rounded UP so the contract never under-collects:
+    /// a fee whose exact basis-point value is fractional is booked at the
+    /// ceiling, not truncated toward zero.
+    #[ink::test]
+    fn premium_auction_creation_rounds_collection_fee_up() {
+        // base_fee = 7 with the default 500bp demand factor gives an exact fee
+        // of 7 * 10500 / 10000 = 7.35 → truncated 7, rounded up 8.
+        let mut contract = FeeManager::new(7, 0, 100_000);
+        let truncated = 7u128.saturating_mul(10_500).saturating_div(10_000);
+        assert_eq!(truncated, 7, "sanity: exact fee is fractional");
+
+        let id = contract.create_premium_auction(1, 500, 3600).unwrap();
+        let fee = contract.get_auction(id).unwrap().fee_paid;
+        assert_eq!(fee, 8, "collection fee must round up (never under-collect)");
+        assert_eq!(contract.fee_treasury(), 8);
+    }
+
+    /// Collecting thousands of micro (dust-sized) fees must not lose or
+    /// invent value: everything recorded lands in the treasury and the
+    /// transparency report exactly.
+    #[ink::test]
+    fn treasury_accounts_thousands_of_micro_fee_iterations_exactly() {
+        let mut contract = FeeManager::new(1000, 100, 100_000);
+        let from = default_accounts().alice;
+        const ITERATIONS: u128 = 5_000;
+        const MICRO_FEE: u128 = 3;
+
+        for _ in 0..ITERATIONS {
+            contract
+                .record_fee_collected(FeeOperation::OracleUpdate, MICRO_FEE, from)
+                .unwrap();
+        }
+
+        let expected = ITERATIONS.saturating_mul(MICRO_FEE);
+        assert_eq!(contract.fee_treasury(), expected);
+        assert_eq!(contract.total_fees_collected, expected);
+        assert_eq!(contract.get_fee_report().total_fees_collected, expected);
+        // Nothing leaked into pending rewards without an explicit distribution.
+        assert_eq!(contract.pending_reward(from), 0);
+    }
+
+    // ========== Congestion window rollover (Issue #1121) ==========
+
+    /// Congestion must recover on its own once the window elapses — even when
+    /// no new fee records arrive — and a subsequent record starts a fresh
+    /// window rather than piggybacking on a stale count.
+    #[ink::test]
+    fn congestion_recovers_without_new_fee_records() {
+        let mut contract = FeeManager::new(1000, 100, 100_000);
+        let from = default_accounts().alice;
+
+        for _ in 0..100 {
+            contract
+                .record_fee_collected(FeeOperation::OracleUpdate, 1, from)
+                .unwrap();
+        }
+        assert_eq!(contract.congestion_index(), 100);
+
+        // Jump exactly one full congestion window with NO new fee records
+        // (the chain timestamp starts at 0 in unit tests).
+        set_time(CONGESTION_WINDOW_SECS);
+        assert_eq!(
+            contract.congestion_index(),
+            0,
+            "a fully-elapsed window must read as 0 congestion without new records"
+        );
+
+        // `update_fee_params` rolls the window over so pricing acts on a fresh
+        // window, and the next record starts from a clean count.
+        contract.update_fee_params().unwrap();
+        assert_eq!(contract.recent_ops_count, 0);
+        contract
+            .record_fee_collected(FeeOperation::OracleUpdate, 1, from)
+            .unwrap();
+        assert_eq!(contract.recent_ops_count, 1);
+    }
+
+    // ========== Distribution remainder carry (Issue #1120) ==========
+
+    /// A distribution that does not divide evenly must carry the remainder
+    /// (plus the treasury share) forward instead of dropping it.
+    #[ink::test]
+    fn distribute_fees_carries_remainder_and_treasury_share_forward() {
+        let accounts = default_accounts();
+        let mut contract = FeeManager::new(1000, 100, 100_000);
+        for v in [accounts.alice, accounts.bob, accounts.charlie] {
+            contract.add_validator(v).unwrap();
+        }
+
+        // 1,000 with a 50% validator share = 500; 500 / 3 validators = 166 each.
+        contract
+            .record_fee_collected(FeeOperation::OracleUpdate, 1_000, accounts.alice)
+            .unwrap();
+        let before = contract.fee_treasury();
+        assert_eq!(before, 1_000);
+
+        contract.distribute_fees().unwrap();
+
+        let paid = contract.pending_reward(accounts.alice)
+            + contract.pending_reward(accounts.bob)
+            + contract.pending_reward(accounts.charlie);
+        assert_eq!(paid, 498, "168 * 3 = 498 paid to validators");
+
+        // Treasury share (500) + division remainder (2) stay in the treasury.
+        assert_eq!(contract.fee_treasury(), 502);
+        assert_eq!(
+            paid.saturating_add(contract.fee_treasury()),
+            before,
+            "validator distributions + treasury must equal the pre-distribution balance"
         );
     }
 }

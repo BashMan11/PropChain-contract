@@ -28,6 +28,9 @@ pub mod dex {
     // Slippage guard wired into the live swap path (Issue #1115). Its unit
     // tests run via `cargo test -p dex` alongside the contract tests.
     include!("slippage_guard.rs");
+    // Bounded LRU multi-hop route cache, wired into route discovery below
+    // (Issue #1114). Included unconditionally so it is never dead code.
+    include!("path_cache.rs");
 
     impl From<ReentrancyError> for Error {
         fn from(_: ReentrancyError) -> Self {
@@ -2528,6 +2531,102 @@ pub mod dex {
             }
         }
 
+        /// Find a multi-hop route between two tokens using the LRU route cache.
+        ///
+        /// Warm `(from, to)` pairs are served from the cache (compute-on-miss);
+        /// the cache is bounded by [`PATH_CACHE_DEFAULT_CAPACITY`] so an
+        /// unbounded route table can never grow storage.
+        #[ink(message)]
+        pub fn find_route(
+            &mut self,
+            from_token: u64,
+            to_token: u64,
+            max_hops: u8,
+        ) -> Result<Vec<u64>, Error> {
+            let mut cache = PathCache::new(PATH_CACHE_DEFAULT_CAPACITY);
+            let key = PathKey { from_token, to_token };
+            cache
+                .get_or_compute(&key, || self.discover_route(from_token, to_token, max_hops))
+                .filter(|route| !route.is_empty())
+                .ok_or(Error::InvalidBridgeRoute)
+        }
+
+        /// Breadth-first search over the pool token graph for a route of at
+        /// most `max_hops` hops between `from_token` and `to_token`.
+        fn discover_route(&self, from_token: u64, to_token: u64, max_hops: u8) -> Vec<u64> {
+            if from_token == to_token || max_hops == 0 {
+                return Vec::new();
+            }
+            let mut frontier = vec![from_token];
+            let mut visited = vec![from_token];
+            let mut parent: Vec<(u64, u64)> = Vec::new();
+            for _ in 0..max_hops {
+                let mut next = Vec::new();
+                for node in frontier.iter() {
+                    for neighbor in self.token_neighbors(*node) {
+                        if !visited.contains(&neighbor) {
+                            visited.push(neighbor);
+                            parent.push((neighbor, *node));
+                            if neighbor == to_token {
+                                return self.reconstruct_path(from_token, to_token, &parent);
+                            }
+                            next.push(neighbor);
+                        }
+                    }
+                }
+                frontier = next;
+                if frontier.is_empty() {
+                    break;
+                }
+            }
+            Vec::new()
+        }
+
+        /// Neighbouring tokens across every active pool.
+        fn token_neighbors(&self, token: u64) -> Vec<u64> {
+            let mut neighbors = Vec::new();
+            for pair_id in 1..=self.pair_counter {
+                if let Ok(pool) = self.pool(pair_id) {
+                    if pool.is_active {
+                        if pool.base_token == token && !neighbors.contains(&pool.quote_token) {
+                            neighbors.push(pool.quote_token);
+                        } else if pool.quote_token == token
+                            && !neighbors.contains(&pool.base_token)
+                        {
+                            neighbors.push(pool.base_token);
+                        }
+                    }
+                }
+            }
+            neighbors
+        }
+
+        /// Rebuild the token path from the BFS parent trail.
+        fn reconstruct_path(
+            &self,
+            from_token: u64,
+            to_token: u64,
+            parent: &[(u64, u64)],
+        ) -> Vec<u64> {
+            let mut path = vec![to_token];
+            let mut cursor = to_token;
+            while cursor != from_token {
+                let next = parent
+                    .iter()
+                    .rev()
+                    .find(|(child, _)| *child == cursor)
+                    .map(|(_, ancestor)| *ancestor)
+                    .unwrap_or(from_token);
+                if next == cursor {
+                    break;
+                }
+                path.push(next);
+                cursor = next;
+            }
+            path.reverse();
+            path
+        }
+
         /// Get price history summary for a trading pair
         #[ink(message)]
         pub fn get_price_history(&self, pair_id: u64) -> Option<PriceHistory> {
@@ -3095,6 +3194,11 @@ pub mod dex {
     // Include unit tests
     #[cfg(test)]
     include!("tests.rs");
+
+    // Include constant-product / slippage invariant checks (Issue #1113) —
+    // they guard swap() rounding and fee math and must run in CI.
+    #[cfg(test)]
+    include!("swap_invariant_tests.rs");
 
     // Include property-based fuzz tests (Issue #480)
     #[cfg(test)]

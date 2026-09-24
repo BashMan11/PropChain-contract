@@ -1224,5 +1224,43 @@ mod tests {
             dex.set_pool_max_slippage(pair_id, 9_999),
             Err(Error::InvalidPair)
         );
+    // ── Route discovery adoption tests (Issue #1114) ──────────────────────
+
+    #[ink::test]
+    fn test_find_route_direct_pair() {
+        let mut dex = setup_dex();
+        dex.create_pool(1, 2, 30, 10_000, 20_000)
+            .expect("create pool 1-2");
+        dex.create_pool(1, 3, 30, 10_000, 20_000)
+            .expect("create pool 1-3");
+
+        let route = dex
+            .find_route(1, 3, 1)
+            .expect("direct pair routes in one hop");
+        assert_eq!(route, vec![1, 3]);
+    }
+
+    #[ink::test]
+    fn test_find_route_multi_hop_honors_max_hops() {
+        let mut dex = setup_dex();
+        dex.create_pool(1, 2, 30, 10_000, 20_000)
+            .expect("create pool 1-2");
+        dex.create_pool(2, 3, 30, 10_000, 20_000)
+            .expect("create pool 2-3");
+
+        // No direct 1-3 pool: one hop is impossible, two hops succeed.
+        assert_eq!(dex.find_route(1, 3, 1), Err(Error::InvalidBridgeRoute));
+        let route = dex.find_route(1, 3, 2).expect("two-hop route exists");
+        assert_eq!(route, vec![1, 2, 3]);
+    }
+
+    #[ink::test]
+    fn test_find_route_same_token_or_unknown_is_rejected() {
+        let mut dex = setup_dex();
+        dex.create_pool(1, 2, 30, 10_000, 20_000)
+            .expect("create pool 1-2");
+
+        assert_eq!(dex.find_route(1, 1, 2), Err(Error::InvalidBridgeRoute));
+        assert_eq!(dex.find_route(1, 99, 2), Err(Error::InvalidBridgeRoute));
     }
 }
