@@ -9,6 +9,9 @@
 
 use ink::storage::Mapping;
 
+mod borrow_rate;
+mod purge;
+mod servicing_status;
 mod status_packing;
 
 #[ink::contract]
@@ -43,6 +46,13 @@ pub mod propchain_lending {
         NoPendingRotation,
         RotationUnauthorized,
         RequestExpired,
+        // Token custody / oracle integrity (#1087, #1088, #1089)
+        ValueMismatch,
+        TransferFailed,
+        InsufficientEscrow,
+        LtvCapExceeded,
+        PriceFeedMissing,
+        PriceFeedStale,
     }
 
     impl From<propchain_traits::ReentrancyError> for LendingError {
@@ -71,6 +81,33 @@ pub mod propchain_lending {
         pub total_deposits: u128,
         pub total_borrows: u128,
         pub base_rate: u32,
+        /// Time-based interest accrued by outstanding borrows, folded in on
+        /// every `deposit`/`borrow` using `compute_borrow_rate` (#1091).
+        pub accrued_interest: u128,
+        /// Block timestamp (seconds) of the last interest snapshot.
+        pub last_interest_timestamp: u64,
+    }
+
+    /// Admin-injected price feed entry for a property (#1088).
+    ///
+    /// The lending contract does not hold its own collateral valuation oracle
+    /// of record, so `liquidate_loan` must not trust caller-supplied prices.
+    /// These values are recorded by the admin from the off-chain valuation
+    /// pipeline and age out after `PropertyLending::price_max_age` seconds.
+    #[derive(
+        Debug,
+        Clone,
+        Copy,
+        PartialEq,
+        Eq,
+        scale::Encode,
+        scale::Decode,
+        ink::storage::traits::StorageLayout,
+    )]
+    #[cfg_attr(feature = "std", derive(scale_info::TypeInfo))]
+    pub struct OraclePrice {
+        pub value: u128,
+        pub reported_at: u64,
     }
 
     #[derive(
@@ -153,7 +190,7 @@ pub mod propchain_lending {
         pub approved: bool,
         pub servicer_id: Option<u64>,
         pub servicing_reference: String,
-        pub servicing_status: String,
+        pub servicing_status: super::servicing_status::ServicingStatus,
         pub collateral_kind: CollateralKind,
         pub term_months: u32,
         pub interest_rate_bps: u32,
@@ -166,13 +203,13 @@ pub mod propchain_lending {
 
     /// SCALE-footprint-compact representation of `LoanApplication` (Issue #738).
     ///
-    /// `bool approved`, the two `String` fields, and the two `Option<u64>`
-    /// fields are folded into a single `u32 status_flags` plus packed payload
-    /// fields. The two enum-valued fields `LoanType` and `CollateralKind`
-    /// collapse to single bytes. The two `String`s become `Vec<u8>`, which
-    /// has the same SCALE width as `String` (compact-length prefix + bytes)
-    /// but is a no_std-friendly representation that does not require UTF-8
-    /// validity enforcement on round-trip.
+    /// `bool approved`, the `servicing_reference` string and the two
+    /// `Option<u64>` fields are folded into a single `u32 status_flags` plus
+    /// packed payload fields. The two enum-valued fields `LoanType` and
+    /// `CollateralKind` collapse to single bytes. `servicing_reference` becomes
+    /// a `Vec<u8>` (same SCALE width as `String`, no_std-friendly), while
+    /// `servicing_status` is the single-byte `ServicingStatus` discriminant so
+    /// only one canonical representation of the field ships (#1090).
     #[derive(scale::Encode, scale::Decode)]
     #[cfg_attr(
         feature = "std",
@@ -194,7 +231,7 @@ pub mod propchain_lending {
         pub start_block_packed: u64,
         pub status_tag: u8,
         pub servicing_reference: Vec<u8>,
-        pub servicing_status: Vec<u8>,
+        pub servicing_status: super::servicing_status::ServicingStatus,
     }
 
     impl From<LoanApplication> for PackedLoanApplication {
@@ -241,7 +278,7 @@ pub mod propchain_lending {
                 start_block_packed: src.start_block.unwrap_or(0),
                 status_tag,
                 servicing_reference: src.servicing_reference.into_bytes(),
-                servicing_status: src.servicing_status.into_bytes(),
+                servicing_status: src.servicing_status,
             }
         }
     }
@@ -263,7 +300,7 @@ pub mod propchain_lending {
                     None
                 },
                 servicing_reference: String::from_utf8(src.servicing_reference).unwrap_or_default(),
-                servicing_status: String::from_utf8(src.servicing_status).unwrap_or_default(),
+                servicing_status: src.servicing_status,
                 collateral_kind: if (src.status_flags & FLAG_COLLATERAL_PROPERTY_TOKENIZED) != 0 {
                     CollateralKind::PropertyTokenized
                 } else {
@@ -600,6 +637,13 @@ pub mod propchain_lending {
         pub loan_collaterals: Mapping<u64, Vec<u64>>,
         // Admin Key Rotation (Issue #496)
         pending_admin_rotation: Option<propchain_traits::KeyRotationRequest>,
+        // #1087: per-account escrow balances for deposit/borrow token custody
+        lender_balances: Mapping<AccountId, u128>,
+        // #1088: admin-injected property price feed for liquidation decisions
+        oracle_prices: Mapping<u64, OraclePrice>,
+        price_max_age: u64,
+        // #1089: portfolio-wide max loan-to-value cap for marketplace loans
+        max_ltv_bps: u32,
     }
 
     #[ink(event)]
@@ -657,7 +701,7 @@ pub mod propchain_lending {
     pub struct LoanServicingStatusUpdated {
         #[ink(topic)]
         loan_id: u64,
-        status: String,
+        status: super::servicing_status::ServicingStatus,
     }
 
     #[ink(event)]
@@ -685,6 +729,14 @@ pub mod propchain_lending {
         #[ink(topic)]
         borrower: AccountId,
         collateral_seized: u128,
+    }
+
+    #[ink(event)]
+    pub struct LoanPurged {
+        #[ink(topic)]
+        loan_id: u64,
+        #[ink(topic)]
+        borrower: AccountId,
     }
 
     #[ink(event)]
@@ -732,6 +784,30 @@ pub mod propchain_lending {
         pub listing_id: u64,
         #[ink(topic)]
         pub borrower: AccountId,
+    }
+
+    #[ink(event)]
+    pub struct OraclePriceUpdated {
+        #[ink(topic)]
+        pub property_id: u64,
+        pub value: u128,
+    }
+
+    #[ink(event)]
+    pub struct PriceMaxAgeUpdated {
+        pub price_max_age: u64,
+    }
+
+    #[ink(event)]
+    pub struct MaxLtvUpdated {
+        pub max_ltv_bps: u32,
+    }
+
+    #[ink(event)]
+    pub struct EscrowCustodied {
+        #[ink(topic)]
+        pub account: AccountId,
+        pub amount: u128,
     }
 
     // ── Admin Key Rotation Events (Issue #496) ────────────────────────────────
@@ -794,6 +870,11 @@ pub mod propchain_lending {
                 loan_collaterals: Mapping::default(),
                 // Admin Key Rotation (Issue #496)
                 pending_admin_rotation: None,
+                // #1087, #1088, #1089
+                lender_balances: Mapping::default(),
+                oracle_prices: Mapping::default(),
+                price_max_age: 3600,
+                max_ltv_bps: 7500,
             }
         }
 
@@ -950,6 +1031,8 @@ pub mod propchain_lending {
                 total_deposits: 0,
                 total_borrows: 0,
                 base_rate,
+                accrued_interest: 0,
+                last_interest_timestamp: self.env().block_timestamp(),
             };
             self.pools.insert(self.pool_count, &pool);
             self.env().emit_event(PoolCreated {
@@ -970,20 +1053,42 @@ pub mod propchain_lending {
         ///
         /// # Errors
         /// - `PoolNotFound` if the pool does not exist.
+        /// - `InvalidParameters` if `amount` is zero.
+        /// - `ValueMismatch` if the transferred value does not equal `amount`
+        ///   (the contract takes custody of the tokens, Issue #1087).
         /// - `ReentrantCall` if a re-entrant execution is detected.
-        #[ink(message)]
+        #[ink(message, payable)]
         pub fn deposit(&mut self, pool_id: u64, amount: u128) -> Result<(), LendingError> {
             propchain_traits::non_reentrant!(self, {
                 let mut pool = self.pools.get(pool_id).ok_or(LendingError::PoolNotFound)?;
+                pool = self.accrue_pool_interest(pool);
                 pool.total_deposits += amount;
+                if amount == 0 {
+                    return Err(LendingError::InvalidParameters);
+                }
+                if self.env().transferred_value() != amount {
+                    return Err(LendingError::ValueMismatch);
+                }
+                pool.total_deposits = pool.total_deposits.saturating_add(amount);
                 self.pools.insert(pool_id, &pool);
+                let caller = self.env().caller();
+                let balance = self.lender_balances.get(caller).unwrap_or(0);
+                self.lender_balances
+                    .insert(caller, &balance.saturating_add(amount));
+                self.env().emit_event(EscrowCustodied {
+                    account: caller,
+                    amount,
+                });
                 Ok(())
             })
         }
 
         /// Borrow liquidity from a lending pool.
         ///
-        /// Callable by anyone, provided sufficient deposits are available.
+        /// Callable by anyone, provided sufficient deposits are available. The
+        /// borrowed amount is transferred out of the contract to the caller
+        /// (Issue #1087) and no pool state is mutated unless the transfer
+        /// succeeds.
         ///
         /// # Parameters
         /// - `pool_id`: source lending pool.
@@ -992,11 +1097,13 @@ pub mod propchain_lending {
         /// # Errors
         /// - `PoolNotFound` if the pool does not exist.
         /// - `InsufficientLiquidity` if available deposits are less than the requested amount.
+        /// - `TransferFailed` if the token transfer out of the contract fails.
         /// - `ReentrantCall` if a re-entrant execution is detected.
         #[ink(message)]
         pub fn borrow(&mut self, pool_id: u64, amount: u128) -> Result<(), LendingError> {
             propchain_traits::non_reentrant!(self, {
                 let mut pool = self.pools.get(pool_id).ok_or(LendingError::PoolNotFound)?;
+                pool = self.accrue_pool_interest(pool);
                 // Overflow-safe capacity check: if `total_borrows + amount`
                 // were to overflow u128 the old raw add could wrap and let
                 // the borrow slip through, so reject instead (Issue #992).
@@ -1007,6 +1114,11 @@ pub mod propchain_lending {
                 if pool.total_deposits < projected_borrows {
                     return Err(LendingError::InsufficientLiquidity);
                 }
+                // Transfer out first: state is only updated once the tokens
+                // have actually left the contract.
+                self.env()
+                    .transfer(self.env().caller(), amount)
+                    .map_err(|_| LendingError::TransferFailed)?;
                 pool.total_borrows += amount;
                 self.pools.insert(pool_id, &pool);
                 Ok(())
@@ -1015,8 +1127,15 @@ pub mod propchain_lending {
 
         /// Query the current borrow rate for a lending pool.
         ///
-        /// Callable by anyone. The rate equals the pool's base rate plus a
-        /// utilisation-dependent component (utilisation / 50, in basis points).
+        /// Callable by anyone. Now that `borrow_rate.rs` is wired into the
+        /// contract (#1091), the rate follows the documented linear model:
+        ///
+        /// `rate_bps = 200 + 1000 × utilisation_bps / 10000`
+        ///
+        /// i.e. a fixed 2% base plus a linearly increasing utilisation
+        /// component of up to +10% at full (100%) utilisation. Input
+        /// utilisation is clamped at 10_000 bps, so the rate saturates at
+        /// 1 200 bps (12%) instead of growing without bound.
         ///
         /// # Parameters
         /// - `pool_id`: the lending pool to query.
@@ -1029,13 +1148,10 @@ pub mod propchain_lending {
         #[ink(message)]
         pub fn borrow_rate(&self, pool_id: u64) -> Result<u32, LendingError> {
             let pool = self.pools.get(pool_id).ok_or(LendingError::PoolNotFound)?;
-            let utilisation = (pool.total_borrows * 10000)
-                .checked_div(pool.total_deposits)
-                .unwrap_or(0);
-            // Saturating instead of a raw add: a wrapped rate would misprice
-            // every loan in the pool (Issue #992). Legitimate inputs are
-            // unaffected - saturation only caps pathological values.
-            Ok(pool.base_rate.saturating_add((utilisation / 50) as u32))
+            let utilisation_bps = ((pool.total_borrows * 10000)
+                .checked_div(pool.total_deposits.max(1))
+                .unwrap_or(0)) as u32;
+            Ok(super::borrow_rate::compute_borrow_rate(utilisation_bps))
         }
 
         /// Open a leveraged margin position.
@@ -1185,7 +1301,7 @@ pub mod propchain_lending {
                 approved: false,
                 servicer_id: None,
                 servicing_reference: String::new(),
-                servicing_status: String::from("Pending"),
+                servicing_status: super::servicing_status::ServicingStatus::Pending,
                 collateral_kind: CollateralKind::Unsecured,
                 term_months,
                 interest_rate_bps,
@@ -1246,7 +1362,7 @@ pub mod propchain_lending {
                 approved: false,
                 servicer_id: None,
                 servicing_reference: String::new(),
-                servicing_status: String::from("Pending"),
+                servicing_status: super::servicing_status::ServicingStatus::Pending,
                 collateral_kind: CollateralKind::Unsecured,
                 term_months,
                 interest_rate_bps,
@@ -1314,7 +1430,7 @@ pub mod propchain_lending {
                 approved: false,
                 servicer_id: None,
                 servicing_reference: String::new(),
-                servicing_status: String::from("Pending"),
+                servicing_status: super::servicing_status::ServicingStatus::Pending,
                 collateral_kind: CollateralKind::PropertyTokenized,
                 term_months,
                 interest_rate_bps,
@@ -1513,7 +1629,7 @@ pub mod propchain_lending {
                 .ok_or(LendingError::LoanNotFound)?;
             loan.servicer_id = Some(servicer_id);
             loan.servicing_reference = external_reference.clone();
-            loan.servicing_status = String::from("Boarded");
+            loan.servicing_status = super::servicing_status::ServicingStatus::Boarded;
             self.loan_applications.insert(loan_id, &loan);
             self.env().emit_event(LoanServicerAssigned {
                 loan_id,
@@ -1654,18 +1770,17 @@ pub mod propchain_lending {
         ///
         /// # Parameters
         /// - `loan_id`: ID of the loan to update.
-        /// - `status`: new servicing status string (e.g. `"Current"`, `"Late"`).
+        /// - `status`: new servicing status (`ServicingStatus`).
         ///
         /// # Errors
         /// - `LoanNotFound` if the loan does not exist.
         /// - `ServicerNotFound` if no servicer is assigned or the servicer record is missing.
         /// - `Unauthorized` if caller is neither the admin nor the servicer account.
-        /// - `InvalidParameters` if `status` is empty.
         #[ink(message)]
         pub fn update_servicing_status(
             &mut self,
             loan_id: u64,
-            status: String,
+            status: super::servicing_status::ServicingStatus,
         ) -> Result<(), LendingError> {
             let mut loan = self
                 .loan_applications
@@ -1680,11 +1795,8 @@ pub mod propchain_lending {
             if caller != self.admin && caller != servicer.account {
                 return Err(LendingError::Unauthorized);
             }
-            if status.is_empty() {
-                return Err(LendingError::InvalidParameters);
-            }
             self.update_interest_snapshot(loan_id)?;
-            loan.servicing_status = status.clone();
+            loan.servicing_status = status;
             self.loan_applications.insert(loan_id, &loan);
             self.env()
                 .emit_event(LoanServicingStatusUpdated { loan_id, status });
@@ -1803,8 +1915,10 @@ pub mod propchain_lending {
         ///
         /// # Parameters
         /// - `loan_id`: ID of the active loan to liquidate.
-        /// - `current_collateral_values`: list of `(property_id, current_value)` pairs
-        ///   representing the latest market value for each pledged collateral.
+        /// - `_current_collateral_values`: list of `(property_id, current_value)`
+        ///   pairs retained for ABI compatibility; the LTV decision ignores
+        ///   these and uses only the admin-injected oracle feed (#1088) so a
+        ///   liquidator can never steer the outcome with self-reported prices.
         ///
         /// # Errors
         /// - `LoanNotFound` if the loan does not exist.
@@ -1813,35 +1927,71 @@ pub mod propchain_lending {
         ///   and the loan has not expired.
         /// - `PropertyNotFound` if a pledged property has no assessment record.
         /// - `InsufficientCollateral` if collateral data is missing or invalid.
+        /// - `ReentrantCall` if a re-entrant liquidation is attempted; the
+        ///   `non_reentrant!` macro (via `propchain_traits::ReentrancyGuard`)
+        ///   is the single authoritative reentrancy mechanism for this path
+        ///   (#1094).
+        /// - `PriceFeedMissing` if no oracle price is recorded for a pledged property.
+        /// - `PriceFeedStale` if the oracle price for a pledged property is older than `price_max_age`.
         #[ink(message)]
         pub fn liquidate_loan(
             &mut self,
             loan_id: u64,
-            current_collateral_values: Vec<(u64, u128)>,
+            _current_collateral_values: Vec<(u64, u128)>,
         ) -> Result<(), LendingError> {
-            let mut app = self
-                .loan_applications
-                .get(loan_id)
-                .ok_or(LendingError::LoanNotFound)?;
+            propchain_traits::non_reentrant!(self, {
+                let mut app = self
+                    .loan_applications
+                    .get(loan_id)
+                    .ok_or(LendingError::LoanNotFound)?;
 
-            if app.status != LoanStatus::Active {
-                return Err(LendingError::LoanNotActive);
-            }
+                if app.status != LoanStatus::Active {
+                    return Err(LendingError::LoanNotActive);
+                }
 
-            self.update_interest_snapshot(loan_id)?;
+                self.update_interest_snapshot(loan_id)?;
 
-            let collaterals = self.loan_collaterals.get(loan_id).unwrap_or_default();
-            if collaterals.is_empty() && app.property_id != 0 {
-                let fallback = vec![app.property_id];
-                self.loan_collaterals.insert(loan_id, &fallback);
-            }
+                let collaterals = self.loan_collaterals.get(loan_id).unwrap_or_default();
+                if collaterals.is_empty() && app.property_id != 0 {
+                    let fallback = vec![app.property_id];
+                    self.loan_collaterals.insert(loan_id, &fallback);
+                }
 
-            let current_collaterals = self.loan_collaterals.get(loan_id).unwrap_or_default();
+                let current_collaterals = self.loan_collaterals.get(loan_id).unwrap_or_default();
 
+                let total_debt = app.requested_amount.saturating_add(app.accrued_interest);
+                let mut total_current_value: u128 = 0;
+                let mut total_assessed_value: u128 = 0;
+                let mut weighted_liquidation_threshold: u128 = 0;
+
+                for &pid in &current_collaterals {
+                    let record = self
+                        .collateral_records
+                        .get(pid)
+                        .ok_or(LendingError::PropertyNotFound)?;
+                    total_assessed_value =
+                        total_assessed_value.saturating_add(record.assessed_value);
+                    weighted_liquidation_threshold = weighted_liquidation_threshold.saturating_add(
+                        record
+                            .assessed_value
+                            .saturating_mul(record.liquidation_threshold as u128),
+                    );
+                    let current_val = current_collateral_values
+                        .iter()
+                        .find(|(id, _)| *id == pid)
+                        .map(|(_, v)| *v)
+                        .unwrap_or(record.assessed_value);
+                    total_current_value = total_current_value.saturating_add(current_val);
+                }
+
+                let effective_threshold = weighted_liquidation_threshold
+                    .checked_div(total_assessed_value)
+                    .ok_or(LendingError::InsufficientCollateral)?;
             let total_debt = app.requested_amount.saturating_add(app.accrued_interest);
             let mut total_current_value: u128 = 0;
             let mut total_assessed_value: u128 = 0;
             let mut weighted_liquidation_threshold: u128 = 0;
+            let now = self.env().block_timestamp();
 
             for &pid in &current_collaterals {
                 let record = self
@@ -1854,45 +2004,213 @@ pub mod propchain_lending {
                         .assessed_value
                         .saturating_mul(record.liquidation_threshold as u128),
                 );
-                let current_val = current_collateral_values
-                    .iter()
-                    .find(|(id, _)| *id == pid)
-                    .map(|(_, v)| *v)
-                    .unwrap_or(record.assessed_value);
-                total_current_value = total_current_value.saturating_add(current_val);
+                // Liquidation valuations come from the oracle feed only; the
+                // caller-supplied `current_collateral_values` argument is
+                // explicitly ignored (Issue #1088).
+                let price = self
+                    .oracle_prices
+                    .get(pid)
+                    .ok_or(LendingError::PriceFeedMissing)?;
+                if now.saturating_sub(price.reported_at) > self.price_max_age {
+                    return Err(LendingError::PriceFeedStale);
+                }
+                total_current_value = total_current_value.saturating_add(price.value);
             }
 
-            let effective_threshold = weighted_liquidation_threshold
-                .checked_div(total_assessed_value)
-                .ok_or(LendingError::InsufficientCollateral)?;
+                let current_ltv = (total_debt * 10000) / total_current_value.max(1);
+                let health_factor_drops = current_ltv > effective_threshold;
 
-            let current_ltv = (total_debt * 10000) / total_current_value.max(1);
-            let health_factor_drops = current_ltv > effective_threshold;
-
-            let mut is_expired = false;
-            if app.loan_type == LoanType::FixedRate {
-                if let Some(start) = app.start_block {
-                    let term_blocks = app.term_months as u64 * 432_000;
-                    if (self.env().block_number() as u64) > start + term_blocks {
-                        is_expired = true;
+                let mut is_expired = false;
+                if app.loan_type == LoanType::FixedRate {
+                    if let Some(start) = app.start_block {
+                        let term_blocks = app.term_months as u64 * 432_000;
+                        if (self.env().block_number() as u64) > start + term_blocks {
+                            is_expired = true;
+                        }
                     }
                 }
+
+                if !health_factor_drops && !is_expired {
+                    return Err(LendingError::LiquidationThresholdNotMet);
+                }
+
+                app.status = LoanStatus::Liquidated;
+                self.loan_applications.insert(loan_id, &app);
+
+                self.env().emit_event(LoanLiquidated {
+                    loan_id,
+                    borrower: app.applicant,
+                    collateral_seized: app.collateral_value,
+                });
+
+                Ok(())
+            })
+        }
+
+        /// Derive the purge eligibility label for a `LoanStatus`, mapping the
+        /// contract's loan lifecycle onto `purge::ApplicationStatus`.
+        ///
+        /// Only loans in terminal, unrecoverable states classify as purgeable:
+        /// `Defaulted` loans (no longer serviceable) map to `Rejected` and
+        /// `Liquidated` loans (collateral already seized) map to `Withdrawn`;
+        /// pending, active, repaid and restructured loans refuse to be purged
+        /// (`purge::is_purgeable`).
+        fn purge_eligibility(status: LoanStatus) -> super::purge::ApplicationStatus {
+            match status {
+                LoanStatus::Defaulted => super::purge::ApplicationStatus::Rejected,
+                LoanStatus::Liquidated => super::purge::ApplicationStatus::Withdrawn,
+                LoanStatus::Pending => super::purge::ApplicationStatus::Pending,
+                _ => super::purge::ApplicationStatus::Approved,
             }
+        }
 
-            if !health_factor_drops && !is_expired {
-                return Err(LendingError::LiquidationThresholdNotMet);
+        /// Purge (garbage-collect) a terminal loan application from storage.
+        ///
+        /// Wires the `purge.rs` helper into a real message (#1092): only loans
+        /// in a terminal, unrecoverable state (`Defaulted` or `Liquidated`) can
+        /// be purged — the safety property `is_purgeable` is enforced here, so
+        /// inactive collateral can be reclaimed instead of sitting in storage
+        /// forever. Admin-only, to keep destructive cleanup behind an explicit
+        /// key.
+        ///
+        /// Removes the application record, its collateral links, and its
+        /// borrower index entry.
+        ///
+        /// # Errors
+        /// - `Unauthorized` if the caller is not the contract admin.
+        /// - `LoanNotFound` if the loan does not exist.
+        /// - `LoanNotActive` if the loan is not in a purgeable terminal state.
+        /// - `ReentrantCall` if a re-entrant execution is detected.
+        #[ink(message)]
+        pub fn purge_application(&mut self, loan_id: u64) -> Result<(), LendingError> {
+            propchain_traits::non_reentrant!(self, {
+                if self.env().caller() != self.admin {
+                    return Err(LendingError::Unauthorized);
+                }
+                let loan = self
+                    .loan_applications
+                    .get(loan_id)
+                    .ok_or(LendingError::LoanNotFound)?;
+                if !super::purge::is_purgeable(Self::purge_eligibility(loan.status)) {
+                    return Err(LendingError::LoanNotActive);
+                }
+
+                self.loan_applications.remove(&loan_id);
+                self.loan_collaterals.remove(&loan_id);
+                let mut borrower_ids = self.borrower_loans.get(loan.applicant).unwrap_or_default();
+                borrower_ids.retain(|&id| id != loan_id);
+                self.borrower_loans.insert(loan.applicant, &borrower_ids);
+
+                self.env().emit_event(LoanPurged {
+                    loan_id,
+                    borrower: loan.applicant,
+                });
+                Ok(())
+            })
+        }
+
+        /// Record a fresh valuation for a property in the liquidation oracle
+        /// feed (Issue #1088).
+        ///
+        /// Admin-only. Values must be non-zero. Each reported value is stamped
+        /// with the current block timestamp so `liquidate_loan` can enforce
+        /// freshness.
+        ///
+        /// # Parameters
+        /// - `property_id`: the property being priced.
+        /// - `value`: the latest oracle value for the property.
+        ///
+        /// # Errors
+        /// - `Unauthorized` if the caller is not the admin.
+        /// - `InvalidParameters` if `value` is zero.
+        #[ink(message)]
+        pub fn set_oracle_price(
+            &mut self,
+            property_id: u64,
+            value: u128,
+        ) -> Result<(), LendingError> {
+            if self.env().caller() != self.admin {
+                return Err(LendingError::Unauthorized);
             }
-
-            app.status = LoanStatus::Liquidated;
-            self.loan_applications.insert(loan_id, &app);
-
-            self.env().emit_event(LoanLiquidated {
-                loan_id,
-                borrower: app.applicant,
-                collateral_seized: app.collateral_value,
-            });
-
+            if value == 0 {
+                return Err(LendingError::InvalidParameters);
+            }
+            self.oracle_prices.insert(
+                property_id,
+                &OraclePrice {
+                    value,
+                    reported_at: self.env().block_timestamp(),
+                },
+            );
+            self.env()
+                .emit_event(OraclePriceUpdated { property_id, value });
             Ok(())
+        }
+
+        /// Read back the liquidation oracle price recorded for a property.
+        #[ink(message)]
+        pub fn get_oracle_price(&self, property_id: u64) -> Option<OraclePrice> {
+            self.oracle_prices.get(property_id)
+        }
+
+        /// Set the maximum age (in seconds) after which a recorded oracle price
+        /// is treated as stale by `liquidate_loan` (Issue #1088).
+        ///
+        /// Admin-only.
+        ///
+        /// # Errors
+        /// - `Unauthorized` if the caller is not the admin.
+        /// - `InvalidParameters` if `seconds` is zero.
+        #[ink(message)]
+        pub fn set_price_max_age(&mut self, seconds: u64) -> Result<(), LendingError> {
+            if self.env().caller() != self.admin {
+                return Err(LendingError::Unauthorized);
+            }
+            if seconds == 0 {
+                return Err(LendingError::InvalidParameters);
+            }
+            self.price_max_age = seconds;
+            self.env().emit_event(PriceMaxAgeUpdated {
+                price_max_age: seconds,
+            });
+            Ok(())
+        }
+
+        #[ink(message)]
+        pub fn get_price_max_age(&self) -> u64 {
+            self.price_max_age
+        }
+
+        /// Configure the portfolio-wide maximum loan-to-value ratio applied to
+        /// marketplace loans at acceptance (Issue #1089).
+        ///
+        /// Admin-only. Basis points scale: 7500 = 75%.
+        ///
+        /// # Errors
+        /// - `Unauthorized` if the caller is not the admin.
+        /// - `InvalidParameters` if the basis-point value is zero or above 10,000.
+        #[ink(message)]
+        pub fn set_max_ltv_bps(&mut self, bps: u32) -> Result<(), LendingError> {
+            if self.env().caller() != self.admin {
+                return Err(LendingError::Unauthorized);
+            }
+            if bps == 0 || bps > 10_000 {
+                return Err(LendingError::InvalidParameters);
+            }
+            self.max_ltv_bps = bps;
+            self.env().emit_event(MaxLtvUpdated { max_ltv_bps: bps });
+            Ok(())
+        }
+
+        #[ink(message)]
+        pub fn get_max_ltv_bps(&self) -> u32 {
+            self.max_ltv_bps
+        }
+
+        /// Query an account's escrow balance held by the contract (Issue #1087).
+        #[ink(message)]
+        pub fn get_lender_balance(&self, account: AccountId) -> u128 {
+            self.lender_balances.get(account).unwrap_or(0)
         }
 
         /// Stake tokens into the yield farming pool.
@@ -2255,74 +2573,120 @@ pub mod propchain_lending {
         /// Borrower accepts a lender's offer and originates the loan (#304).
         ///
         /// Accepting an offer transitions the listing to `OfferAccepted`, creates
-        /// the underlying `LoanApplication`, and marks the listing as `Originated`.
+        /// the underlying `LoanApplication`, and marks the listing as
+        /// `Originated`. Before accepting, the loan amount must not exceed the
+        /// configured LTV cap (Issue #1089) and the lender must have already
+        /// escrowed the offered amount with the contract via `deposit`. On
+        /// acceptance the escrow is moved out to the borrower.
+        ///
+        /// # Errors
+        /// - `LoanNotFound` if the offer or its listing does not exist.
+        /// - `Unauthorized` if the caller is not the listing's borrower.
+        /// - `LoanNotActive` if the listing is no longer open.
+        /// - `InvalidParameters` if the offer was already accepted.
+        /// - `InsufficientCollateral` if the pledged property has no assessment record.
+        /// - `LtvCapExceeded` if the offered amount exceeds `assessed_value × max_ltv_bps`.
+        /// - `InsufficientEscrow` if the lender has not escrowed at least the offered amount.
+        /// - `TransferFailed` if the escrowed funds cannot be moved to the borrower.
+        /// - `ReentrantCall` if a re-entrant execution is detected.
         #[ink(message)]
         pub fn accept_loan_offer(&mut self, offer_id: u64) -> Result<u64, LendingError> {
-            let mut offer = self
-                .marketplace_offers
-                .get(offer_id)
-                .ok_or(LendingError::LoanNotFound)?;
+            propchain_traits::non_reentrant!(self, {
+                let mut offer = self
+                    .marketplace_offers
+                    .get(offer_id)
+                    .ok_or(LendingError::LoanNotFound)?;
 
-            let mut listing = self
-                .marketplace_listings
-                .get(offer.listing_id)
-                .ok_or(LendingError::LoanNotFound)?;
+                let mut listing = self
+                    .marketplace_listings
+                    .get(offer.listing_id)
+                    .ok_or(LendingError::LoanNotFound)?;
 
-            let borrower = self.env().caller();
-            if listing.borrower != borrower {
-                return Err(LendingError::Unauthorized);
-            }
+                let borrower = self.env().caller();
+                if listing.borrower != borrower {
+                    return Err(LendingError::Unauthorized);
+                }
 
-            if !matches!(listing.status, ListingStatus::Open) {
-                return Err(LendingError::LoanNotActive);
-            }
+                if !matches!(listing.status, ListingStatus::Open) {
+                    return Err(LendingError::LoanNotActive);
+                }
 
-            if offer.is_accepted {
-                return Err(LendingError::InvalidParameters);
-            }
+                if offer.is_accepted {
+                    return Err(LendingError::InvalidParameters);
+                }
 
-            // Originate the underlying loan application
-            let loan_id = self.loan_count + 1;
-            let loan = LoanApplication {
-                loan_id,
-                applicant: borrower,
-                property_id: listing.property_id,
-                requested_amount: offer.offered_amount,
-                collateral_value: offer.offered_amount,
-                credit_score: self.get_credit_score(borrower),
-                approved: true,
-                servicer_id: None,
-                servicing_reference: String::new(),
-                servicing_status: String::from("marketplace_originated"),
-                collateral_kind: listing.collateral_kind,
-                term_months: offer.term_months,
-                interest_rate_bps: offer.rate_bps,
-                loan_type: LoanType::Variable,
-                start_block: None,
-                status: LoanStatus::Active,
-                accrued_interest: 0,
-                last_interest_timestamp: self.env().block_timestamp(),
-            };
+                // #1089: enforce the LTV cap against the on-chain assessed value
+                // of the pledged collateral (not the lender's self-reported figure).
+                let assessed = self
+                    .collateral_records
+                    .get(listing.property_id)
+                    .ok_or(LendingError::InsufficientCollateral)?;
+                // Cross-multiplied so truncation cannot hide a breach:
+                // offered * 10000 > assessed * max_ltv_bps  =>  LTV > cap.
+                if offer.offered_amount.saturating_mul(10_000)
+                    > assessed
+                        .assessed_value
+                        .saturating_mul(self.max_ltv_bps as u128)
+                {
+                    return Err(LendingError::LtvCapExceeded);
+                }
 
-            self.loan_applications.insert(loan_id, &loan);
-            self.loan_count = loan_id;
+                // #1089: the lender must have escrowed the funds beforehand.
+                let escrow = self.lender_balances.get(offer.lender).unwrap_or(0);
+                if escrow < offer.offered_amount {
+                    return Err(LendingError::InsufficientEscrow);
+                }
 
-            // Update offer and listing state
-            offer.is_accepted = true;
-            listing.status = ListingStatus::Originated;
-            listing.accepted_offer_id = Some(offer_id);
+                // #1087: escrowed value moves out to the borrower on origination.
+                self.env()
+                    .transfer(borrower, offer.offered_amount)
+                    .map_err(|_| LendingError::TransferFailed)?;
+                self.lender_balances
+                    .insert(offer.lender, &(escrow - offer.offered_amount));
 
-            self.marketplace_offers.insert(offer_id, &offer);
-            self.marketplace_listings
-                .insert(listing.listing_id, &listing);
+                // Originate the underlying loan application
+                let loan_id = self.loan_count + 1;
+                let loan = LoanApplication {
+                    loan_id,
+                    applicant: borrower,
+                    property_id: listing.property_id,
+                    requested_amount: offer.offered_amount,
+                    collateral_value: assessed.assessed_value,
+                    credit_score: self.get_credit_score(borrower),
+                    approved: true,
+                    servicer_id: None,
+                    servicing_reference: String::new(),
+                    servicing_status: super::servicing_status::ServicingStatus::Boarded,
+                    collateral_kind: listing.collateral_kind,
+                    term_months: offer.term_months,
+                    interest_rate_bps: offer.rate_bps,
+                    loan_type: LoanType::Variable,
+                    start_block: None,
+                    status: LoanStatus::Active,
+                    accrued_interest: 0,
+                    last_interest_timestamp: self.env().block_timestamp(),
+                };
 
-            self.env().emit_event(LoanOfferAccepted {
-                listing_id: offer.listing_id,
-                offer_id,
-                loan_id,
-            });
+                self.loan_applications.insert(loan_id, &loan);
+                self.loan_count = loan_id;
 
-            Ok(loan_id)
+                // Update offer and listing state
+                offer.is_accepted = true;
+                listing.status = ListingStatus::Originated;
+                listing.accepted_offer_id = Some(offer_id);
+
+                self.marketplace_offers.insert(offer_id, &offer);
+                self.marketplace_listings
+                    .insert(listing.listing_id, &listing);
+
+                self.env().emit_event(LoanOfferAccepted {
+                    listing_id: offer.listing_id,
+                    offer_id,
+                    loan_id,
+                });
+
+                Ok(loan_id)
+            })
         }
 
         /// Borrower cancels an open listing (#304).
@@ -2561,11 +2925,88 @@ pub mod propchain_lending {
             self.loan_applications.insert(loan_id, &loan);
             Ok(())
         }
+
+        /// Fold time-based interest into a pool's `accrued_interest` balance.
+        ///
+        /// Uses the same annualised convention as `compute_accrued_interest`
+        /// (block timestamps treated as seconds, so a full year elapses in
+        /// 31_536_000 timestamp units) and the wired `compute_borrow_rate`
+        /// linear curve. Called at the start of every `deposit` and `borrow`
+        /// so pool state always reflects the current interest snapshot (#1091).
+        fn accrue_pool_interest(&self, mut pool: LendingPool) -> LendingPool {
+            let current_timestamp = self.env().block_timestamp();
+            if pool.total_borrows == 0 || pool.last_interest_timestamp == 0 {
+                pool.last_interest_timestamp = current_timestamp;
+                return pool;
+            }
+            if current_timestamp <= pool.last_interest_timestamp {
+                return pool;
+            }
+            let utilisation_bps = ((pool.total_borrows * 10_000)
+                .checked_div(pool.total_deposits.max(1))
+                .unwrap_or(0)) as u32;
+            let rate_bps = super::borrow_rate::compute_borrow_rate(utilisation_bps);
+            let accrued = Self::compute_accrued_interest(
+                pool.total_borrows,
+                rate_bps,
+                current_timestamp.saturating_sub(pool.last_interest_timestamp),
+            );
+            pool.accrued_interest = pool.accrued_interest.saturating_add(accrued);
+            pool.last_interest_timestamp = current_timestamp;
+            pool
+        }
     }
 
     impl Default for PropertyLending {
         fn default() -> Self {
             Self::new(AccountId::from([0x0; 32]))
+        }
+    }
+
+    /// Regression tests for the #1094 decision: `liquidate_loan` is protected
+    /// by the `non_reentrant!` macro (via `propchain_traits::ReentrancyGuard`)
+    /// and the standalone `liquidation_reentrancy::LiquidationGuard` dead
+    /// module has been removed, so the macro is the single authoritative
+    /// reentrancy mechanism for the liquidation path.
+    #[cfg(test)]
+    mod liquidation_reentrancy_tests {
+        use ink::env::{test, DefaultEnvironment};
+
+        use super::*;
+
+        /// Simulates a call frame already in progress (the guard is held by an
+        /// outer liquidation frame) and asserts the re-entrant liquidation
+        /// attempt is rejected before any state is touched.
+        #[ink::test]
+        fn reentrant_liquidation_attempt_reverts() {
+            let accounts = test::default_accounts::<DefaultEnvironment>();
+            test::set_caller::<DefaultEnvironment>(accounts.alice);
+            let mut contract = PropertyLending::new(accounts.alice);
+
+            contract.reentrancy_guard.enter().unwrap();
+            assert_eq!(
+                contract.liquidate_loan(1, vec![]),
+                Err(LendingError::ReentrantCall)
+            );
+        }
+
+        /// Sanity check: with a free guard the liquidation path still works
+        /// normally, so the guard does not over-block legitimate calls.
+        #[ink::test]
+        fn liquidation_succeeds_when_guard_is_free() {
+            let accounts = test::default_accounts::<DefaultEnvironment>();
+            test::set_caller::<DefaultEnvironment>(accounts.alice);
+            let mut contract = PropertyLending::new(accounts.alice);
+
+            contract
+                .assess_collateral(1, 1_000_000, 7500, 8000)
+                .unwrap();
+            for _ in 0..6 {
+                contract.record_repayment(accounts.alice).unwrap();
+            }
+            let loan_id = contract.apply_for_loan(1, 700_000, 1_000_000, 0).unwrap();
+            contract.underwrite_loan(loan_id).unwrap();
+            assert!(contract.liquidate_loan(loan_id, vec![(1, 850_000)]).is_ok());
         }
     }
 }
@@ -2595,6 +3036,25 @@ mod tests {
         PropertyLending::new(accounts.alice)
     }
 
+    /// Top up the off-chain contract (callee) balance so `borrow`'s outgoing
+    /// `env().transfer` does not underflow the simulated contract account.
+    fn fund_contract() {
+        let callee = test::callee::<DefaultEnvironment>();
+        let base = test::get_account_balance::<DefaultEnvironment>(callee).unwrap_or_default();
+        test::set_account_balance::<DefaultEnvironment>(callee, base + 100_000_000_000_000);
+    }
+
+    /// Deposit with the matching transferred value (`deposit` now requires
+    /// `transferred_value() == amount`, Issue #1087).
+    fn deposit(
+        contract: &mut PropertyLending,
+        pool_id: u64,
+        amount: u128,
+    ) -> Result<(), LendingError> {
+        test::set_value_transferred::<DefaultEnvironment>(amount);
+        contract.deposit(pool_id, amount)
+    }
+
     #[ink::test]
     fn test_assess_collateral() {
         let mut contract = setup();
@@ -2616,6 +3076,23 @@ mod tests {
     }
 
     #[ink::test]
+    fn test_servicing_status_round_trips_through_packed_representation() {
+        use super::servicing_status::ServicingStatus;
+        let mut contract = setup();
+        let loan_id = contract.apply_for_loan(1, 700_000, 1_000_000, 700).unwrap();
+        let loan = contract.get_loan(loan_id).unwrap();
+        assert_eq!(loan.servicing_status, ServicingStatus::Pending);
+
+        let packed = crate::propchain_lending::PackedLoanApplication::from(loan.clone());
+        assert_eq!(packed.servicing_status, ServicingStatus::Pending);
+
+        let opened: crate::propchain_lending::LoanApplication = packed.into();
+        assert_eq!(opened.servicing_status, ServicingStatus::Pending);
+        assert_eq!(opened.loan_id, loan.loan_id);
+        assert_eq!(opened.servicing_reference, loan.servicing_reference);
+    }
+
+    #[ink::test]
     fn test_create_pool() {
         let mut contract = setup();
         let pool_id = contract.create_pool(500).unwrap();
@@ -2628,7 +3105,8 @@ mod tests {
     fn test_pool_operations() {
         let mut contract = setup();
         let pool_id = contract.create_pool(500).unwrap();
-        assert!(contract.deposit(pool_id, 1_000_000).is_ok());
+        assert!(deposit(&mut contract, pool_id, 1_000_000).is_ok());
+        fund_contract();
         assert!(contract.borrow(pool_id, 500_000).is_ok());
         let rate = contract.borrow_rate(pool_id).unwrap();
         assert!(rate > 500);
@@ -2674,15 +3152,18 @@ mod tests {
         let loan = contract.get_loan(loan_id).unwrap();
         assert_eq!(loan.servicer_id, Some(servicer_id));
         assert_eq!(loan.servicing_reference, "EXT-123");
-        assert_eq!(loan.servicing_status, "Boarded");
+        assert_eq!(
+            loan.servicing_status,
+            super::servicing_status::ServicingStatus::Boarded
+        );
 
         test::set_caller::<DefaultEnvironment>(accounts.bob);
         contract
-            .update_servicing_status(loan_id, String::from("Current"))
+            .update_servicing_status(loan_id, super::servicing_status::ServicingStatus::InDefault)
             .unwrap();
         assert_eq!(
             contract.get_loan(loan_id).unwrap().servicing_status,
-            "Current"
+            super::servicing_status::ServicingStatus::InDefault
         );
     }
 
@@ -2747,7 +3228,10 @@ mod tests {
 
         test::set_caller::<DefaultEnvironment>(accounts.charlie);
         assert_eq!(
-            contract.update_servicing_status(loan_id, String::from("Late")),
+            contract.update_servicing_status(
+                loan_id,
+                super::servicing_status::ServicingStatus::InDefault
+            ),
             Err(LendingError::Unauthorized)
         );
         assert_eq!(
@@ -2803,6 +3287,9 @@ mod tests {
         }
         let loan_id = contract.apply_for_loan(1, 700_000, 1_000_000, 0).unwrap();
         contract.underwrite_loan(loan_id).unwrap();
+        // The oracle (not the caller) now prices the collateral; 700K debt
+        // against an 850K oracle valuation exceeds the 80% liquidation LTV.
+        contract.set_oracle_price(1, 850_000).unwrap();
         assert!(contract.liquidate_loan(loan_id, vec![(1, 850_000)]).is_ok());
         let loan = contract.get_loan(loan_id).unwrap();
         assert_eq!(loan.status, LoanStatus::Liquidated);
@@ -3018,6 +3505,8 @@ mod tests {
         contract.pledge_additional_collateral(loan_id, 2).unwrap();
 
         // Trigger liquidation with devalued collaterals
+        contract.set_oracle_price(1, 300_000).unwrap();
+        contract.set_oracle_price(2, 100_000).unwrap();
         assert!(contract
             .liquidate_loan(loan_id, vec![(1, 300_000), (2, 100_000)])
             .is_ok());
@@ -3025,13 +3514,68 @@ mod tests {
         assert_eq!(loan.status, LoanStatus::Liquidated);
     }
 
-    /// Issue #992: a borrow that would overflow `total_borrows + amount`
-    /// must be rejected instead of slipping through a wrapped comparison.
+    /// Issue #1092: a terminal (liquidated) loan can be garbage-collected via
+    /// `purge_application`, which removes the record and its borrower index.
+    #[ink::test]
+    fn test_purge_application_removes_liquidated_loan() {
+        let mut contract = setup();
+        let accounts = test::default_accounts::<DefaultEnvironment>();
+        for _ in 0..6 {
+            contract.record_repayment(accounts.alice).unwrap();
+        }
+        contract
+            .assess_collateral(1, 1_000_000, 7500, 8000)
+            .unwrap();
+        let loan_id = contract.apply_for_loan(1, 700_000, 1_000_000, 0).unwrap();
+        contract.underwrite_loan(loan_id).unwrap();
+        contract
+            .liquidate_loan(loan_id, vec![(1, 850_000)])
+            .unwrap();
+
+        assert!(contract.purge_application(loan_id).is_ok());
+        assert!(contract.get_loan(loan_id).is_none());
+        // Purging an already-purged loan reports it as missing.
+        assert_eq!(
+            contract.purge_application(loan_id),
+            Err(LendingError::LoanNotFound)
+        );
+    }
+
+    /// Issue #1092: active loans are not purgeable, and only the admin may
+    /// purge. Enforcing `purge::is_purgeable` must reject both cases.
+    #[ink::test]
+    fn test_purge_application_rejects_active_loan_and_non_admin() {
+        let mut contract = setup();
+        let accounts = test::default_accounts::<DefaultEnvironment>();
+        for _ in 0..6 {
+            contract.record_repayment(accounts.alice).unwrap();
+        }
+        contract
+            .assess_collateral(1, 1_000_000, 7500, 8000)
+            .unwrap();
+        let loan_id = contract.apply_for_loan(1, 700_000, 1_000_000, 0).unwrap();
+        contract.underwrite_loan(loan_id).unwrap();
+
+        // An active (non-terminal) loan must not be purgeable.
+        assert_eq!(
+            contract.purge_application(loan_id),
+            Err(LendingError::LoanNotActive)
+        );
+        assert!(contract.get_loan(loan_id).is_some());
+
+        // Non-admin callers are rejected with `Unauthorized`.
+        test::set_caller::<DefaultEnvironment>(accounts.bob);
+        assert_eq!(
+            contract.purge_application(loan_id),
+            Err(LendingError::Unauthorized)
+        );
+        assert!(contract.get_loan(loan_id).is_some());
+    }
     #[ink::test]
     fn test_borrow_rejects_overflowing_amount() {
         let mut contract = setup();
         let pool_id = contract.create_pool(500).unwrap();
-        assert!(contract.deposit(pool_id, 1_000_000).is_ok());
+        assert!(deposit(&mut contract, pool_id, 1_000_000).is_ok());
 
         // `u128::MAX + 1000` would wrap; the old raw add let such borrows pass.
         assert_eq!(
@@ -3045,34 +3589,80 @@ mod tests {
         assert_eq!(pool.total_deposits, 1_000_000);
 
         // Normal borrowing still works after the rejection.
+        fund_contract();
         assert!(contract.borrow(pool_id, 500_000).is_ok());
     }
 
-    /// Issue #992: `borrow_rate` must saturate rather than wrap when
-    /// `base_rate + utilisation term` exceeds u32::MAX.
+    /// Issue #1091: utilisation boundaries (0 / 50 / 100 %) must return the
+    /// rates pinned by the wired `borrow_rate::compute_borrow_rate` linear
+    /// curve (base 200 bps + slope 1000 bps at full utilisation).
     #[ink::test]
-    fn test_borrow_rate_saturates_at_max() {
+    fn test_borrow_rate_boundaries_match_linear_curve() {
         let mut contract = setup();
         // No headroom above base_rate; any utilisation term must not wrap
         // to a small (mispriced) rate.
         let pool_id = contract.create_pool(u32::MAX).unwrap();
-        assert!(contract.deposit(pool_id, 1_000_000).is_ok());
+        assert!(deposit(&mut contract, pool_id, 1_000_000).is_ok());
+        fund_contract();
         assert!(contract.borrow(pool_id, 100_000).is_ok());
 
-        let rate = contract.borrow_rate(pool_id).unwrap();
-        assert_eq!(rate, u32::MAX);
+        // 0% utilisation -> base rate only (200 bps).
+        let empty_pool = contract.create_pool(500).unwrap();
+        assert!(contract.deposit(empty_pool, 10_000).is_ok());
+        assert_eq!(contract.borrow_rate(empty_pool).unwrap(), 200);
+
+        // 50% utilisation -> 200 + 1000 * 5000 / 10000 = 700 bps.
+        let half_pool = contract.create_pool(500).unwrap();
+        assert!(contract.deposit(half_pool, 10_000).is_ok());
+        assert!(contract.borrow(half_pool, 5_000).is_ok());
+        assert_eq!(contract.borrow_rate(half_pool).unwrap(), 700);
+
+        // 100% utilisation -> 200 + 1000 = 1200 bps (saturation cap).
+        let full_pool = contract.create_pool(500).unwrap();
+        assert!(contract.deposit(full_pool, 10_000).is_ok());
+        assert!(contract.borrow(full_pool, 10_000).is_ok());
+        assert_eq!(contract.borrow_rate(full_pool).unwrap(), 1200);
     }
 
-    /// Boundary pin: for legitimate inputs the rate formula is unchanged.
+    /// Boundary pin: for a legitimate utilisation the rate matches the wired
+    /// linear model exactly.
     #[ink::test]
     fn test_borrow_rate_matches_formula_for_normal_inputs() {
         let mut contract = setup();
         let pool_id = contract.create_pool(500).unwrap();
-        assert!(contract.deposit(pool_id, 10_000).is_ok());
+        assert!(deposit(&mut contract, pool_id, 10_000).is_ok());
+        fund_contract();
         assert!(contract.borrow(pool_id, 2_500).is_ok());
 
-        // 25% utilisation = 2500 bps; 2500 / 50 = 50 -> rate 550.
-        assert_eq!(contract.borrow_rate(pool_id).unwrap(), 550);
+        // 25% utilisation = 2500 bps; 200 + 1000 * 2500 / 10000 = 450.
+        assert_eq!(contract.borrow_rate(pool_id).unwrap(), 450);
+    }
+
+    /// Issue #1091: interest accrual must be reflected in pool state. Folded
+    /// on every deposit/borrow, using the annualised seconds convention of
+    /// `compute_accrued_interest`, so one full year at 50% utilisation (rate
+    /// 700 bps on a 500_000 outstanding borrow) accrues exactly 35_000.
+    #[ink::test]
+    fn test_pool_interest_accrual_is_reflected_in_state() {
+        let mut contract = setup();
+        let pool_id = contract.create_pool(500).unwrap();
+
+        // Start from a non-zero timestamp so `last_interest_timestamp == 0`
+        // (the "never tracked" sentinel) is not confused with a real snapshot.
+        test::set_block_timestamp::<DefaultEnvironment>(100);
+
+        // Deposit and first borrow both snapshot the timestamp; no accrual yet.
+        assert!(contract.deposit(pool_id, 1_000_000).is_ok());
+        assert!(contract.borrow(pool_id, 500_000).is_ok());
+        let pool = contract.get_pool(pool_id).unwrap();
+        assert_eq!(pool.accrued_interest, 0);
+
+        // One full year later the next mutation folds interest in.
+        test::set_block_timestamp::<DefaultEnvironment>(100 + 31_536_000);
+        assert!(contract.borrow(pool_id, 500_000).is_ok());
+
+        let pool = contract.get_pool(pool_id).unwrap();
+        assert_eq!(pool.accrued_interest, 35_000);
     }
 
     // ── Issue #1034: Pool-management edge case tests ──────────────────────
@@ -3087,10 +3677,7 @@ mod tests {
 
         // Bob is not the admin — his call must be rejected.
         test::set_caller::<DefaultEnvironment>(accounts.bob);
-        assert_eq!(
-            contract.create_pool(300),
-            Err(LendingError::Unauthorized)
-        );
+        assert_eq!(contract.create_pool(300), Err(LendingError::Unauthorized));
 
         // The pool count must be untouched.
         assert!(contract.get_pool(1).is_none());
@@ -3103,7 +3690,7 @@ mod tests {
         let mut contract = setup();
         let pool_id = contract.create_pool(400).unwrap();
 
-        assert!(contract.deposit(pool_id, 2_000_000).is_ok());
+        assert!(deposit(&mut contract, pool_id, 2_000_000).is_ok());
 
         let pool = contract.get_pool(pool_id).unwrap();
         assert_eq!(pool.total_deposits, 2_000_000);
@@ -3119,7 +3706,7 @@ mod tests {
         let pool_id = contract.create_pool(500).unwrap();
 
         // Fund the pool with exactly 1_000_000.
-        assert!(contract.deposit(pool_id, 1_000_000).is_ok());
+        assert!(deposit(&mut contract, pool_id, 1_000_000).is_ok());
 
         // Attempting to borrow more than the available deposit must fail.
         assert_eq!(
@@ -3140,7 +3727,8 @@ mod tests {
         let mut contract = setup();
         let pool_id = contract.create_pool(600).unwrap();
 
-        assert!(contract.deposit(pool_id, 1_000_000).is_ok());
+        assert!(deposit(&mut contract, pool_id, 1_000_000).is_ok());
+        fund_contract();
         assert!(contract.borrow(pool_id, 400_000).is_ok());
 
         let pool = contract.get_pool(pool_id).unwrap();
@@ -3157,10 +3745,264 @@ mod tests {
     #[ink::test]
     fn test_deposit_pool_not_found() {
         let mut contract = setup();
+        assert_eq!(contract.deposit(999, 100), Err(LendingError::PoolNotFound));
+    }
+
+    // ── Issue #1087: deposit/borrow token custody ──────────────────────────
+
+    /// A deposit whose transferred value does not equal the requested amount
+    /// must be rejected without changing pool state.
+    #[ink::test]
+    fn test_deposit_rejects_transferred_value_mismatch() {
+        let mut contract = setup();
+        let pool_id = contract.create_pool(500).unwrap();
+
+        test::set_value_transferred::<DefaultEnvironment>(900_000);
         assert_eq!(
-            contract.deposit(999, 100),
-            Err(LendingError::PoolNotFound)
+            contract.deposit(pool_id, 1_000_000),
+            Err(LendingError::ValueMismatch)
         );
+
+        let pool = contract.get_pool(pool_id).unwrap();
+        assert_eq!(pool.total_deposits, 0);
+        let accounts = test::default_accounts::<DefaultEnvironment>();
+        assert_eq!(contract.get_lender_balance(accounts.alice), 0);
+    }
+
+    /// A successful deposit takes custody of the value and credits the
+    /// depositor's escrow ledger.
+    #[ink::test]
+    fn test_deposit_escrows_and_credits_lender_balance() {
+        let mut contract = setup();
+        let accounts = test::default_accounts::<DefaultEnvironment>();
+        let pool_id = contract.create_pool(500).unwrap();
+
+        deposit(&mut contract, pool_id, 2_000_000).unwrap();
+
+        assert_eq!(contract.get_lender_balance(accounts.alice), 2_000_000);
+        assert_eq!(
+            contract.get_pool(pool_id).unwrap().total_deposits,
+            2_000_000
+        );
+    }
+
+    /// Borrowing moves tokens out of the contract: after a borrow the caller's
+    /// balance increased and the contract (callee) balance decreased.
+    /// NOTE: in direct `#[ink::test]` calls the callee is the default caller
+    /// (`accounts.alice`), so the borrower is swapped to `accounts.bob` to
+    /// exercise a genuinely cross-account transfer.
+    #[ink::test]
+    fn test_borrow_transfers_value_to_caller() {
+        let accounts = test::default_accounts::<DefaultEnvironment>();
+        test::set_caller::<DefaultEnvironment>(accounts.alice);
+        let mut contract = PropertyLending::new(accounts.alice);
+        let pool_id = contract.create_pool(500).unwrap();
+        deposit(&mut contract, pool_id, 1_000_000).unwrap();
+        fund_contract();
+
+        let callee = test::callee::<DefaultEnvironment>();
+        let contract_before =
+            test::get_account_balance::<DefaultEnvironment>(callee).unwrap_or_default();
+        let caller_before =
+            test::get_account_balance::<DefaultEnvironment>(accounts.bob).unwrap_or_default();
+
+        test::set_caller::<DefaultEnvironment>(accounts.bob);
+        contract.borrow(pool_id, 400_000).unwrap();
+
+        let contract_after =
+            test::get_account_balance::<DefaultEnvironment>(callee).unwrap_or_default();
+        let caller_after =
+            test::get_account_balance::<DefaultEnvironment>(accounts.bob).unwrap_or_default();
+        assert_eq!(contract_before.saturating_sub(contract_after), 400_000);
+        assert_eq!(caller_after - caller_before, 400_000);
+        assert_eq!(contract.get_pool(pool_id).unwrap().total_borrows, 400_000);
+    }
+
+    /// Borrowing against a pool does not mint claims out of thin air: the
+    /// caller's escrow must not grow from a borrow that pulled tokens out.
+    #[ink::test]
+    fn test_borrow_does_not_credit_escrow() {
+        let mut contract = setup();
+        let accounts = test::default_accounts::<DefaultEnvironment>();
+        let pool_id = contract.create_pool(500).unwrap();
+        deposit(&mut contract, pool_id, 1_000_000).unwrap();
+        fund_contract();
+
+        contract.borrow(pool_id, 400_000).unwrap();
+
+        // Only the original 1_000_000 deposit is escrowed; the 400_000 borrow
+        // did not mint an additional claim.
+        assert_eq!(contract.get_lender_balance(accounts.alice), 1_000_000);
+    }
+
+    // ── Issue #1088: oracle-driven liquidation ─────────────────────────────
+
+    /// A liquidation with no oracle price for the pledged collateral is a hard
+    /// error, not a slippable decision.
+    #[ink::test]
+    fn test_liquidation_requires_oracle_price() {
+        let mut contract = setup();
+        let accounts = test::default_accounts::<DefaultEnvironment>();
+        contract
+            .assess_collateral(1, 1_000_000, 7500, 8000)
+            .unwrap();
+        for _ in 0..6 {
+            contract.record_repayment(accounts.alice).unwrap();
+        }
+        let loan_id = contract.apply_for_loan(1, 700_000, 1_000_000, 0).unwrap();
+        contract.underwrite_loan(loan_id).unwrap();
+
+        assert_eq!(
+            contract.liquidate_loan(loan_id, vec![(1, 850_000)]),
+            Err(LendingError::PriceFeedMissing)
+        );
+    }
+
+    /// A caller-supplied bullish value cannot force liquidation when the
+    /// oracle disagrees: the oracle price drives the LTV decision.
+    #[ink::test]
+    fn test_liquidation_ignores_caller_prices() {
+        let mut contract = setup();
+        let accounts = test::default_accounts::<DefaultEnvironment>();
+        contract
+            .assess_collateral(1, 1_000_000, 7500, 8000)
+            .unwrap();
+        for _ in 0..6 {
+            contract.record_repayment(accounts.alice).unwrap();
+        }
+        let loan_id = contract.apply_for_loan(1, 700_000, 1_000_000, 0).unwrap();
+        contract.underwrite_loan(loan_id).unwrap();
+
+        // Oracle says the collateral is worth 2,000,000 (healthy). Even though
+        // the liquidator claims 800,000 (breach), the loan must NOT liquidate.
+        contract.set_oracle_price(1, 2_000_000).unwrap();
+        assert_eq!(
+            contract.liquidate_loan(loan_id, vec![(1, 800_000)]),
+            Err(LendingError::LiquidationThresholdNotMet)
+        );
+    }
+
+    /// A stale oracle feed is a hard error so liquidations never run against
+    /// outdated valuations.
+    #[ink::test]
+    fn test_liquidation_rejects_stale_oracle_price() {
+        let mut contract = setup();
+        let accounts = test::default_accounts::<DefaultEnvironment>();
+        contract
+            .assess_collateral(1, 1_000_000, 7500, 8000)
+            .unwrap();
+        for _ in 0..6 {
+            contract.record_repayment(accounts.alice).unwrap();
+        }
+        let loan_id = contract.apply_for_loan(1, 700_000, 1_000_000, 0).unwrap();
+        contract.underwrite_loan(loan_id).unwrap();
+
+        test::set_block_timestamp::<DefaultEnvironment>(100);
+        contract.set_oracle_price(1, 850_000).unwrap();
+        // Age the price beyond the default 3600s window.
+        test::set_block_timestamp::<DefaultEnvironment>(100 + 3601);
+        assert_eq!(
+            contract.liquidate_loan(loan_id, vec![(1, 850_000)]),
+            Err(LendingError::PriceFeedStale)
+        );
+    }
+
+    /// Admin-only feed writes: non-admins are rejected.
+    #[ink::test]
+    fn test_oracle_price_writes_are_admin_only() {
+        let mut contract = setup();
+        let accounts = test::default_accounts::<DefaultEnvironment>();
+        test::set_caller::<DefaultEnvironment>(accounts.bob);
+        assert_eq!(
+            contract.set_oracle_price(1, 1_000_000),
+            Err(LendingError::Unauthorized)
+        );
+        assert_eq!(
+            contract.set_max_ltv_bps(6000),
+            Err(LendingError::Unauthorized)
+        );
+        assert_eq!(
+            contract.set_price_max_age(1800),
+            Err(LendingError::Unauthorized)
+        );
+    }
+
+    // ── Issue #1089: marketplace LTV cap + lender escrow ───────────────────
+
+    fn listing_offer_fixture() -> (PropertyLending, test::DefaultAccounts<DefaultEnvironment>) {
+        let accounts = test::default_accounts::<DefaultEnvironment>();
+        test::set_caller::<DefaultEnvironment>(accounts.alice);
+        let mut contract = PropertyLending::new(accounts.alice);
+        // Assessed at 2_000_000 with a 75% portfolio cap => max lend 1_500_000.
+        contract
+            .assess_collateral(1, 2_000_000, 7000, 8500)
+            .unwrap();
+        contract
+            .create_loan_listing(
+                1,
+                1_000_000,
+                800,
+                12,
+                crate::propchain_lending::CollateralKind::PropertyTokenized,
+                vec![],
+            )
+            .unwrap();
+        (contract, accounts)
+    }
+
+    /// An offer above `assessed_value × max_ltv_bps` must be refused at
+    /// acceptance.
+    #[ink::test]
+    fn test_accept_offer_above_ltv_cap_is_refused() {
+        let (mut contract, accounts) = listing_offer_fixture();
+        test::set_caller::<DefaultEnvironment>(accounts.bob);
+        // 1_600_000 exceeds the 1_500_000 cap (75% of the 2_000_000 assessed
+        // value), so acceptance must be refused even with funds escrowed.
+        let offer_id = contract.submit_loan_offer(1, 1_600_000, 700, 12).unwrap();
+        test::set_caller::<DefaultEnvironment>(accounts.alice);
+        assert_eq!(
+            contract.accept_loan_offer(offer_id),
+            Err(LendingError::LtvCapExceeded)
+        );
+    }
+
+    /// A lender who has not escrowed the offered amount cannot have the offer
+    /// accepted.
+    #[ink::test]
+    fn test_accept_offer_requires_lender_escrow() {
+        let (mut contract, accounts) = listing_offer_fixture();
+        test::set_caller::<DefaultEnvironment>(accounts.bob);
+        let offer_id = contract.submit_loan_offer(1, 1_000_000, 700, 12).unwrap();
+        test::set_caller::<DefaultEnvironment>(accounts.alice);
+        // Bob has not deposited anything: no escrow, so acceptance fails.
+        assert_eq!(
+            contract.accept_loan_offer(offer_id),
+            Err(LendingError::InsufficientEscrow)
+        );
+    }
+
+    /// A funded, in-cap offer is accepted: the loan collateralises the on-chain
+    /// assessed value and the escrow moves from lender ledger to borrower.
+    #[ink::test]
+    fn test_accept_offer_with_escrow_originates_loan() {
+        let (mut contract, accounts) = listing_offer_fixture();
+        // Pool is admin-created; Bob (a lender) then funds his escrow into it.
+        let pool_id = contract.create_pool(500).unwrap();
+        test::set_caller::<DefaultEnvironment>(accounts.bob);
+        assert!(deposit(&mut contract, pool_id, 1_000_000).is_ok());
+
+        let offer_id = contract.submit_loan_offer(1, 1_000_000, 700, 12).unwrap();
+
+        test::set_caller::<DefaultEnvironment>(accounts.alice);
+        fund_contract();
+        let loan_id = contract.accept_loan_offer(offer_id).unwrap();
+
+        let loan = contract.get_loan(loan_id).unwrap();
+        assert_eq!(loan.collateral_value, 2_000_000);
+        assert_eq!(loan.requested_amount, 1_000_000);
+        assert_eq!(loan.status, LoanStatus::Active);
+        // Escrow consumed; nothing remains for Bob.
+        assert_eq!(contract.get_lender_balance(accounts.bob), 0);
     }
 }
 
@@ -3326,5 +4168,4 @@ mod storage_derivation_tests {
 #[path = "test.rs"]
 mod lending_regression_test;
 
-pub mod liquidation_reentrancy;
 pub mod yield_optimization;

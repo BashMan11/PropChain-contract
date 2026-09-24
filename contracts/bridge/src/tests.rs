@@ -1873,6 +1873,15 @@ mod tests {
 
         let metadata = PropertyMetadata {
             location: String::from("Test"),
+    // ── Granular pause tests (Issue #1112) ────────────────────────────────
+    //
+    // Each test pauses ONE BridgeOperation and proves the matching message
+    // reverts with OperationPaused while unrelated operations keep working,
+    // then resumes and shows service is restored.
+
+    fn metadata() -> PropertyMetadata {
+        PropertyMetadata {
+            location: String::from("Test Property"),
             size: 1000,
             legal_description: String::from("Test"),
             valuation: 100000,
@@ -2067,5 +2076,291 @@ mod tests {
         let extra = AccountId::from([0xffu8; 32]);
         assert_eq!(bridge.add_validator(extra), Err(Error::InsufficientSignatures));
         assert_eq!(bridge.get_validators().len(), 100);
+        }
+    }
+
+    fn flags_with(cross_chain_trades: bool) -> propchain_traits::PauseFlags {
+        propchain_traits::PauseFlags {
+            all_operations: false,
+            new_requests: false,
+            signing: false,
+            execution: false,
+            cross_chain_trades,
+        }
+    }
+
+    #[ink::test]
+    fn test_granular_pause_new_requests_blocks_only_new_requests() {
+        let mut bridge = setup_bridge();
+        let accounts = test::default_accounts::<DefaultEnvironment>();
+        test::set_caller::<DefaultEnvironment>(accounts.alice);
+
+        bridge
+            .emergency_pause(
+                propchain_traits::PauseFlags {
+                    new_requests: true,
+                    ..flags_with(false)
+                },
+                propchain_traits::PauseReason::ManualAdmin,
+                Some(String::from("granular pause test")),
+            )
+            .expect("admin can pause NewRequest");
+
+        assert!(bridge.is_operation_paused(propchain_traits::BridgeOperation::NewRequest));
+        assert!(!bridge.is_operation_paused(propchain_traits::BridgeOperation::CrossChainTrade));
+
+        // NewRequest is gated...
+        let blocked = bridge.initiate_bridge_multisig(1, 2, accounts.bob, 2, Some(50), metadata());
+        assert_eq!(blocked, Err(Error::OperationPaused));
+
+        // ...while an unrelated operation keeps succeeding.
+        let trade_id = bridge
+            .register_cross_chain_trade(9, Some(7), 2, accounts.charlie, 50_000, 49_000)
+            .expect("unrelated cross-chain trade must still succeed while NewRequest is paused");
+        assert!(trade_id > 0);
+
+        // Resume restores service.
+        bridge
+            .emergency_unpause(propchain_traits::PauseFlags {
+                new_requests: true,
+                ..flags_with(false)
+            })
+            .expect("admin can resume NewRequest");
+        assert!(!bridge.is_operation_paused(propchain_traits::BridgeOperation::NewRequest));
+        let resumed = bridge.initiate_bridge_multisig(1, 2, accounts.bob, 2, Some(50), metadata());
+        assert!(resumed.is_ok());
+    }
+
+    #[ink::test]
+    fn test_granular_pause_signing_blocks_only_signing() {
+        let mut bridge = setup_bridge();
+        let accounts = test::default_accounts::<DefaultEnvironment>();
+        test::set_caller::<DefaultEnvironment>(accounts.alice);
+        bridge
+            .add_validator(accounts.alice)
+            .expect("admin can add validator");
+
+        let request_id = bridge
+            .initiate_bridge_multisig(1, 2, accounts.bob, 2, Some(50), metadata())
+            .expect("request creation should succeed");
+
+        bridge
+            .emergency_pause(
+                propchain_traits::PauseFlags {
+                    signing: true,
+                    ..flags_with(false)
+                },
+                propchain_traits::PauseReason::ManualAdmin,
+                Some(String::from("granular pause test")),
+            )
+            .expect("admin can pause Signing");
+
+        assert!(bridge.is_operation_paused(propchain_traits::BridgeOperation::Signing));
+        assert!(!bridge.is_operation_paused(propchain_traits::BridgeOperation::NewRequest));
+        assert!(!bridge.is_operation_paused(propchain_traits::BridgeOperation::Execution));
+
+        // Signing is gated...
+        let blocked = bridge.sign_bridge_request(request_id, true);
+        assert_eq!(blocked, Err(Error::OperationPaused));
+
+        // ...while request creation keeps working.
+        let other = bridge.initiate_bridge_multisig(2, 3, accounts.charlie, 2, Some(50), metadata());
+        assert!(other.is_ok());
+
+        // Resume restores service.
+        bridge
+            .emergency_unpause(propchain_traits::PauseFlags {
+                signing: true,
+                ..flags_with(false)
+            })
+            .expect("admin can resume Signing");
+        assert!(!bridge.is_operation_paused(propchain_traits::BridgeOperation::Signing));
+        let signed = bridge.sign_bridge_request(request_id, true);
+        assert!(signed.is_ok());
+    }
+
+    #[ink::test]
+    fn test_granular_pause_execution_blocks_only_execution() {
+        let mut bridge = setup_bridge();
+        let accounts = test::default_accounts::<DefaultEnvironment>();
+        test::set_caller::<DefaultEnvironment>(accounts.alice);
+        bridge
+            .add_validator(accounts.alice)
+            .expect("add validator alice");
+        bridge
+            .add_validator(accounts.bob)
+            .expect("add validator bob");
+        bridge
+            .add_bridge_operator(accounts.bob)
+            .expect("add operator bob");
+
+        let request_id = bridge
+            .initiate_bridge_multisig(1, 2, accounts.charlie, 2, Some(50), metadata())
+            .expect("initiation should succeed");
+
+        test::set_caller::<DefaultEnvironment>(accounts.alice);
+        bridge
+            .sign_bridge_request(request_id, true)
+            .expect("alice signs");
+        test::set_caller::<DefaultEnvironment>(accounts.bob);
+        bridge
+            .sign_bridge_request(request_id, true)
+            .expect("bob signs");
+
+        test::set_caller::<DefaultEnvironment>(accounts.alice);
+        bridge
+            .emergency_pause(
+                propchain_traits::PauseFlags {
+                    execution: true,
+                    ..flags_with(false)
+                },
+                propchain_traits::PauseReason::ManualAdmin,
+                Some(String::from("granular pause test")),
+            )
+            .expect("admin can pause Execution");
+
+        assert!(bridge.is_operation_paused(propchain_traits::BridgeOperation::Execution));
+        assert!(!bridge.is_operation_paused(propchain_traits::BridgeOperation::Signing));
+
+        // Fully-signed request is still gated at execution...
+        let blocked = bridge.execute_bridge(request_id);
+        assert_eq!(blocked, Err(Error::OperationPaused));
+
+        // ...while unrelated operations keep working.
+        let trade_id = bridge
+            .register_cross_chain_trade(9, Some(7), 2, accounts.charlie, 50_000, 49_000)
+            .expect("cross-chain trade must still succeed while Execution is paused");
+        assert!(trade_id > 0);
+
+        // Resume restores service.
+        bridge
+            .emergency_unpause(propchain_traits::PauseFlags {
+                execution: true,
+                ..flags_with(false)
+            })
+            .expect("admin can resume Execution");
+        assert!(!bridge.is_operation_paused(propchain_traits::BridgeOperation::Execution));
+        let executed = bridge.execute_bridge(request_id);
+        assert!(executed.is_ok());
+    }
+
+    #[ink::test]
+    fn test_granular_pause_cross_chain_blocks_only_cross_chain() {
+        let mut bridge = setup_bridge();
+        let accounts = test::default_accounts::<DefaultEnvironment>();
+        test::set_caller::<DefaultEnvironment>(accounts.alice);
+
+        bridge
+            .emergency_pause(
+                flags_with(true),
+                propchain_traits::PauseReason::ManualAdmin,
+                Some(String::from("granular pause test")),
+            )
+            .expect("admin can pause CrossChainTrade");
+
+        assert!(bridge.is_operation_paused(propchain_traits::BridgeOperation::CrossChainTrade));
+        assert!(!bridge.is_operation_paused(propchain_traits::BridgeOperation::NewRequest));
+
+        let blocked = bridge.register_cross_chain_trade(9, Some(7), 2, accounts.charlie, 50_000, 49_000);
+        assert_eq!(blocked, Err(Error::OperationPaused));
+
+        let other = bridge.initiate_bridge_multisig(1, 2, accounts.bob, 2, Some(50), metadata());
+        assert!(other.is_ok());
+
+        bridge
+            .emergency_unpause(flags_with(true))
+            .expect("admin can resume CrossChainTrade");
+        assert!(!bridge.is_operation_paused(propchain_traits::BridgeOperation::CrossChainTrade));
+        let trade_id = bridge
+            .register_cross_chain_trade(9, Some(7), 2, accounts.charlie, 50_000, 49_000)
+            .expect("cross-chain trade resumes after unpause");
+        assert!(trade_id > 0);
+    }
+
+    // ── Signature payload binding tests (Issue #1111) ─────────────────────
+
+    #[ink::test]
+    fn test_signed_payload_covers_amount_source_and_destination() {
+        let accounts = test::default_accounts::<DefaultEnvironment>();
+        let caller = accounts.bob;
+
+        let full = PropertyBridge::signature_binding_hash(42, true, caller, 7, 1000, 1, 2);
+
+        // Binding only (request_id, approve, caller, block) as before is no
+        // longer sufficient: an approval signing that tuple must be rejected
+        // once the transfer payload exists.
+        let old_shape = propchain_traits::crypto::hash_encoded(&(42u64, true, caller, 7u32));
+        assert_ne!(full, old_shape, "payload must bind more than the original tuple");
+
+        // Altering amount, source or destination must change the binding hash.
+        assert_ne!(
+            full,
+            PropertyBridge::signature_binding_hash(42, true, caller, 7, 1001, 1, 2),
+            "a different amount must produce a different binding"
+        );
+        assert_ne!(
+            full,
+            PropertyBridge::signature_binding_hash(42, true, caller, 7, 1000, 9, 2),
+            "a different source chain must produce a different binding"
+        );
+        assert_ne!(
+            full,
+            PropertyBridge::signature_binding_hash(42, true, caller, 7, 1000, 1, 9),
+            "a different destination chain must produce a different binding"
+        );
+    }
+
+    #[ink::test]
+    fn test_old_shape_approval_is_rejected() {
+        let mut bridge = setup_bridge();
+        let accounts = test::default_accounts::<DefaultEnvironment>();
+        test::set_caller::<DefaultEnvironment>(accounts.alice);
+        test::set_block_number::<DefaultEnvironment>(42);
+        bridge
+            .add_bridge_operator(accounts.alice)
+            .expect("admin can add operator");
+
+        let request_id = bridge
+            .initiate_bridge_multisig(1, 2, accounts.bob, 2, Some(50), metadata())
+            .expect("request creation should succeed");
+
+        bridge
+            .register_operator_public_key([7u8; 33])
+            .expect("operator can register key");
+
+        // Approval signs the OLD tuple (no amount/chains) — must be rejected
+        // even before any signature math, because the stored request's amount
+        // and chains are not covered.
+        let old_shape_hash =
+            <[u8; 32]>::from(propchain_traits::crypto::hash_encoded(&(
+                request_id,
+                true,
+                accounts.alice,
+                42u32,
+            )));
+        let approval = propchain_traits::SignedApproval {
+            signature: [0u8; 65],
+            message_hash: old_shape_hash,
+        };
+        let result = bridge.sign_bridge_request_with_signature(request_id, true, Some(approval));
+        assert_eq!(result, Err(Error::Unauthorized));
+
+        // An approval that IS bound to the stored amount/chains gets past the
+        // binding check and is rejected only at signature verification.
+        let bound_hash = <[u8; 32]>::from(PropertyBridge::signature_binding_hash(
+            request_id,
+            true,
+            accounts.alice,
+            42,
+            100000,
+            1,
+            2,
+        ));
+        let approval = propchain_traits::SignedApproval {
+            signature: [0u8; 65],
+            message_hash: bound_hash,
+        };
+        let result = bridge.sign_bridge_request_with_signature(request_id, true, Some(approval));
+        assert_eq!(result, Err(Error::Unauthorized));
     }
 }

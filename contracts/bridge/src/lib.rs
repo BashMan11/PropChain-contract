@@ -1223,6 +1223,30 @@ mod bridge {
             Ok(())
         }
 
+        /// Canonical signature-binding payload for a signed bridge approval.
+        ///
+        /// Covers request_id, approve flag, caller, block, and the transfer
+        /// amount + chains drawn from the STORED request (Issue #1111).
+        fn signature_binding_hash(
+            request_id: u64,
+            approve: bool,
+            caller: AccountId,
+            block_number: u32,
+            amount: u128,
+            source_chain: ChainId,
+            destination_chain: ChainId,
+        ) -> Hash {
+            propchain_traits::crypto::hash_encoded(&(
+                request_id,
+                approve,
+                caller,
+                block_number,
+                amount,
+                source_chain,
+                destination_chain,
+            ))
+        }
+
         /// Sign a bridge request with optional ECDSA cryptographic signature verification.
         #[ink(message)]
         pub fn sign_bridge_request_with_signature(
@@ -1238,18 +1262,31 @@ mod bridge {
                     .operator_public_keys
                     .get(caller)
                     .ok_or(Error::Unauthorized)?;
-                propchain_traits::crypto::verify_signed_approval(approval, &expected_key)
-                    .map_err(|_| Error::Unauthorized)?;
 
-                let expected_hash = propchain_traits::crypto::hash_encoded(&(
+                // Bind the signature to the full request payload before doing
+                // any crypto: the cheapest check fires first. The stored
+                // request's amount (metadata.valuation), source chain and
+                // destination chain must be covered so an approval cannot be
+                // replayed against an altered transfer payload.
+                let request = self
+                    .bridge_requests
+                    .get(request_id)
+                    .ok_or(Error::InvalidRequest)?;
+                let expected_hash = Self::signature_binding_hash(
                     request_id,
                     approve,
                     caller,
                     self.env().block_number(),
-                ));
+                    request.metadata.valuation,
+                    request.source_chain,
+                    request.destination_chain,
+                );
                 if approval.message_hash != <[u8; 32]>::from(expected_hash) {
                     return Err(Error::Unauthorized);
                 }
+
+                propchain_traits::crypto::verify_signed_approval(approval, &expected_key)
+                    .map_err(|_| Error::Unauthorized)?;
             }
 
             self.sign_bridge_request(request_id, approve)
