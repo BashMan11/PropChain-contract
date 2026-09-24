@@ -18,6 +18,14 @@ pub enum Error {
     ProposalExpired,
     /// Signer roster changes are blocked while proposals are actively voting.
     SignerChangesLocked,
+    /// The signer roster is at its configured maximum (Issue #1124).
+    MaxSigners,
+    /// The caller cannot vote because they have an active delegation (Issue #1123).
+    StillDelegated,
+    /// Self-delegation is not allowed (Issue #1123).
+    InvalidDelegationTarget,
+    /// The admin rotation target is the current admin or the zero address (Issue #1126).
+    InvalidRotationTarget,
 }
 
 impl core::fmt::Display for Error {
@@ -38,6 +46,12 @@ impl core::fmt::Display for Error {
             Error::ProposalExpired => write!(f, "Proposal has expired"),
             Error::SignerChangesLocked => {
                 write!(f, "Signer roster is locked while proposals are actively voting")
+            }
+            Error::MaxSigners => write!(f, "Signer roster is at its configured maximum"),
+            Error::StillDelegated => write!(f, "Delegators cannot vote directly"),
+            Error::InvalidDelegationTarget => write!(f, "Self-delegation is not allowed"),
+            Error::InvalidRotationTarget => {
+                write!(f, "Admin rotation target must differ from the admin and be non-zero")
             }
         }
     }
@@ -60,6 +74,14 @@ impl ContractError for Error {
             Error::NotASigner => governance_codes::GOVERNANCE_NOT_A_SIGNER,
             Error::ProposalExpired => governance_codes::GOVERNANCE_PROPOSAL_EXPIRED,
             Error::SignerChangesLocked => governance_codes::GOVERNANCE_SIGNER_CHANGES_LOCKED,
+            Error::MaxSigners => governance_codes::GOVERNANCE_MAX_SIGNERS,
+            Error::StillDelegated => governance_codes::GOVERNANCE_STILL_DELEGATED,
+            Error::InvalidDelegationTarget => {
+                governance_codes::GOVERNANCE_INVALID_DELEGATION_TARGET
+            }
+            Error::InvalidRotationTarget => {
+                governance_codes::GOVERNANCE_INVALID_ROTATION_TARGET
+            }
         }
     }
 
@@ -80,6 +102,12 @@ impl ContractError for Error {
             Error::ProposalExpired => "The proposal voting period has expired",
             Error::SignerChangesLocked => {
                 "Signer roster is locked while proposals are actively voting"
+            }
+            Error::MaxSigners => "Signer roster is at its configured maximum",
+            Error::StillDelegated => "Delegators cannot vote directly",
+            Error::InvalidDelegationTarget => "Self-delegation is not allowed",
+            Error::InvalidRotationTarget => {
+                "Admin rotation target must differ from the admin and be non-zero"
             }
         }
     }

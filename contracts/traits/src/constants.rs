@@ -106,6 +106,10 @@ pub const GOVERNANCE_DEFAULT_TIMELOCK_BLOCKS: u64 = 100;
 /// Maximum number of active proposals at once.
 pub const GOVERNANCE_MAX_ACTIVE_PROPOSALS: u32 = 100;
 
+/// Grace period (in blocks) before a pending emergency override takes effect,
+/// giving the signer set a window to notice and cancel a stale override.
+pub const GOVERNANCE_EMERGENCY_OVERRIDE_GRACE_BLOCKS: u64 = 20;
+
 // ── Staking Constants ────────────────────────────────────────────────────────
 
 /// Minimum stake amount (in smallest token unit).
