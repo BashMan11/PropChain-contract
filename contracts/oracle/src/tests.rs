@@ -711,6 +711,34 @@ mod oracle_tests {
         assert!(oracle.pending_requests.get(&2).is_some());
         assert!(oracle.pending_requests.get(&3).is_some());
     }
+
+    #[ink::test]
+    fn test_ai_source_without_engine_errors_not_placeholder_price() {
+        let mut oracle = setup_oracle();
+        let accounts = test::default_accounts::<DefaultEnvironment>();
+
+        oracle
+            .add_oracle_source(OracleSource {
+                id: "ai_model".to_string(),
+                source_type: OracleSourceType::AIModel,
+                address: accounts.bob,
+                is_active: true,
+                weight: 50,
+                last_updated: ink::env::block_timestamp::<DefaultEnvironment>(),
+            })
+            .unwrap();
+
+        // No AI valuation engine configured => PriceFeedError, and never the
+        // old deterministic `500000 + property_id * 1000` formula.
+        let source = oracle
+            .oracle_sources
+            .get(&"ai_model".to_string())
+            .expect("source registered");
+        assert_eq!(
+            oracle.get_price_from_source(&source, 7),
+            Err(OracleError::PriceFeedError)
+        );
+    }
 }
 
 // =========================================================================
@@ -910,6 +938,184 @@ mod auto_slash_tests {
         assert_eq!(
             oracle.get_source_missed_updates("nonexistent".to_string()),
             0
+        );
+    }
+
+    #[ink::test]
+    fn test_auto_slash_on_deviation_reduces_reputation_and_stake() {
+        let mut oracle = setup();
+        add_source(&mut oracle, "deviant_src");
+
+        // Enable deviation auto-slash (20% default threshold).
+        oracle
+            .set_auto_slash_config(false, 3600, true, 2000, false, 3)
+            .unwrap();
+
+        // Source reported price 1500 against consensus 1000 (50% deviation).
+        test::set_block_timestamp::<DefaultEnvironment>(100);
+        oracle
+            .source_last_report_time
+            .insert(&"deviant_src".to_string(), &100u64);
+        oracle
+            .source_last_reported_price
+            .insert(&"deviant_src".to_string(), &1500u128);
+
+        let rep_before = oracle
+            .source_reputations
+            .get(&"deviant_src".to_string())
+            .unwrap_or(0);
+        let stake_before = oracle
+            .source_stakes
+            .get(&"deviant_src".to_string())
+            .unwrap_or(0);
+
+        oracle.run_auto_slash_checks(1000);
+
+        let rep_after = oracle
+            .source_reputations
+            .get(&"deviant_src".to_string())
+            .unwrap_or(0);
+        let stake_after = oracle
+            .source_stakes
+            .get(&"deviant_src".to_string())
+            .unwrap_or(0);
+
+        // Reputation 500 -> 350 (moderate penalty), stake 1_000_000 -> 850_000.
+        assert!(rep_after < rep_before, "reputation must drop for a deviation");
+        assert!(stake_after < stake_before, "stake must be slashed for a deviation");
+        assert_eq!(rep_after, 350);
+        assert_eq!(stake_after, 850_000);
+        // A single slash does not freeze the source yet.
+        assert!(oracle.active_sources.contains(&"deviant_src".to_string()));
+    }
+
+    #[ink::test]
+    fn test_repeated_deviation_outliers_decrease_reputation_and_freeze_source() {
+        let mut oracle = setup();
+        add_source(&mut oracle, "deviant_src");
+
+        oracle
+            .set_auto_slash_config(false, 3600, true, 2000, false, 3)
+            .unwrap();
+
+        test::set_block_timestamp::<DefaultEnvironment>(100);
+        oracle
+            .source_last_report_time
+            .insert(&"deviant_src".to_string(), &100u64);
+        oracle
+            .source_last_reported_price
+            .insert(&"deviant_src".to_string(), &1500u128);
+
+        // The source keeps reporting the same runaway price every cycle.
+        let mut frozen = false;
+        let mut rep = 0u32;
+        for _ in 0..10 {
+            oracle.run_auto_slash_checks(1000);
+            oracle
+                .source_last_report_time
+                .insert(&"deviant_src".to_string(), &100u64);
+            oracle
+                .source_last_reported_price
+                .insert(&"deviant_src".to_string(), &1500u128);
+            rep = oracle
+                .source_reputations
+                .get(&"deviant_src".to_string())
+                .unwrap_or(0);
+            if !oracle.active_sources.contains(&"deviant_src".to_string()) {
+                frozen = true;
+                break;
+            }
+        }
+
+        assert!(frozen, "repeated outliers must freeze (deactivate) the source");
+        assert!(
+            rep < propchain_traits::constants::ORACLE_MIN_REPUTATION_THRESHOLD,
+            "reputation keeps decreasing below the threshold, got {rep}"
+        );
+    }
+
+    #[ink::test]
+    fn test_no_deviation_slash_when_price_within_threshold() {
+        let mut oracle = setup();
+        add_source(&mut oracle, "well_behaved");
+
+        oracle
+            .set_auto_slash_config(false, 3600, true, 2000, false, 3)
+            .unwrap();
+
+        test::set_block_timestamp::<DefaultEnvironment>(100);
+        oracle
+            .source_last_report_time
+            .insert(&"well_behaved".to_string(), &100u64);
+        // 1100 vs consensus 1000 = 10% < 20% threshold -> no slash.
+        oracle
+            .source_last_reported_price
+            .insert(&"well_behaved".to_string(), &1100u128);
+
+        oracle.run_auto_slash_checks(1000);
+
+        let rep = oracle
+            .source_reputations
+            .get(&"well_behaved".to_string())
+            .unwrap_or(0);
+        let stake = oracle
+            .source_stakes
+            .get(&"well_behaved".to_string())
+            .unwrap_or(0);
+        assert_eq!(rep, 500);
+        assert_eq!(stake, 1_000_000);
+        assert!(oracle.active_sources.contains(&"well_behaved".to_string()));
+    }
+
+    #[ink::test]
+    fn test_slash_malicious_oracle_message_reduces_reputation() {
+        let mut oracle = setup();
+        add_source(&mut oracle, "bad_src");
+
+        oracle
+            .slash_malicious_oracle("bad_src".to_string(), "BadActor".to_string())
+            .unwrap();
+
+        let status = oracle
+            .get_source_status("bad_src".to_string())
+            .expect("status exists");
+        // Severe: -300 reputation, 30% of 1_000_000 stake.
+        assert_eq!(status.reputation, 200);
+        assert_eq!(status.stake, 700_000);
+        assert_eq!(status.total_slashes, 1);
+        assert!(!status.is_banned);
+    }
+
+    #[ink::test]
+    fn test_slash_malicious_oracle_message_freezes_after_repeated_slashes() {
+        let mut oracle = setup();
+        add_source(&mut oracle, "bad_src");
+
+        for _ in 0..10 {
+            oracle
+                .slash_malicious_oracle("bad_src".to_string(), "Repeated".to_string())
+                .unwrap();
+        }
+
+        let status = oracle
+            .get_source_status("bad_src".to_string())
+            .expect("status exists");
+        let frozen = !oracle.active_sources.contains(&"bad_src".to_string());
+        assert!(frozen, "repeated malicious slashes must freeze the source");
+        assert!(!status.is_active);
+        assert!(status.reputation < 200);
+    }
+
+    #[ink::test]
+    fn test_slash_malicious_oracle_requires_admin() {
+        let mut oracle = setup();
+        add_source(&mut oracle, "bad_src");
+        let accounts = test::default_accounts::<DefaultEnvironment>();
+
+        test::set_caller::<DefaultEnvironment>(accounts.bob);
+        assert_eq!(
+            oracle.slash_malicious_oracle("bad_src".to_string(), "Rogue".to_string()),
+            Err(OracleError::Unauthorized)
         );
     }
 }

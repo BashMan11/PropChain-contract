@@ -3087,10 +3087,7 @@ mod tests {
 
         // Bob is not the admin — his call must be rejected.
         test::set_caller::<DefaultEnvironment>(accounts.bob);
-        assert_eq!(
-            contract.create_pool(300),
-            Err(LendingError::Unauthorized)
-        );
+        assert_eq!(contract.create_pool(300), Err(LendingError::Unauthorized));
 
         // The pool count must be untouched.
         assert!(contract.get_pool(1).is_none());
@@ -3157,10 +3154,7 @@ mod tests {
     #[ink::test]
     fn test_deposit_pool_not_found() {
         let mut contract = setup();
-        assert_eq!(
-            contract.deposit(999, 100),
-            Err(LendingError::PoolNotFound)
-        );
+        assert_eq!(contract.deposit(999, 100), Err(LendingError::PoolNotFound));
     }
 }
 
