@@ -103,6 +103,18 @@ jobs:
           echo "\`\`\`" >> AUDIT_LOG.md
           echo "---" >> AUDIT_LOG.md
 
+      - name: Test Gate — bridge granular pauses, signature payloads, dex invariants
+        run: |
+          set -o pipefail
+          echo "## 🧪 Test Gate: bridge granular pause / sig payload / dex invariants" >> AUDIT_LOG.md
+          echo "\`\`\`text" >> AUDIT_LOG.md
+          cargo test -p propchain-bridge granular_ 2>&1 | tee -a AUDIT_LOG.md
+          cargo test -p propchain-bridge signed_payload 2>&1 | tee -a AUDIT_LOG.md
+          cargo test -p propchain-bridge old_shape_approval 2>&1 | tee -a AUDIT_LOG.md
+          cargo test -p propchain-dex swap_invariant 2>&1 | tee -a AUDIT_LOG.md
+          echo "\`\`\`" >> AUDIT_LOG.md
+          echo "---" >> AUDIT_LOG.md
+
       - name: Evaluate Audit Results
         if: always()
         run: |
