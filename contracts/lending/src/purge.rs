@@ -14,7 +14,10 @@ pub enum ApplicationStatus {
 /// Only rejected or withdrawn applications are eligible for purge; active
 /// or approved applications must never be removable this way.
 pub fn is_purgeable(status: ApplicationStatus) -> bool {
-    matches!(status, ApplicationStatus::Rejected | ApplicationStatus::Withdrawn)
+    matches!(
+        status,
+        ApplicationStatus::Rejected | ApplicationStatus::Withdrawn
+    )
 }
 
 #[cfg(test)]
