@@ -805,6 +805,57 @@ mod tests {
         assert_eq!(
             gov.request_admin_rotation(AccountId::from([0u8; 32])),
             Err(Error::InvalidRotationTarget)
+    // ========== Treasury & budget proposals (Issue #1122) ==========
+
+    /// Seed the contract's own account so native disbursements can succeed and
+    /// be debited.
+    fn fund_contract_balance(amount: u128) {
+        let callee = ink::env::test::callee::<ink::env::DefaultEnvironment>();
+        ink::env::test::set_account_balance::<ink::env::DefaultEnvironment>(callee, amount);
+    }
+
+    #[ink::test]
+    fn treasury_can_be_funded_and_queried() {
+        let accounts = default_accounts();
+        let mut gov = create_governance();
+        assert_eq!(gov.get_treasury_balance(), 0);
+        assert_eq!(gov.get_treasury_spend_limit(), 0);
+
+        set_caller(accounts.bob);
+        ink::env::test::set_value_transferred::<ink::env::DefaultEnvironment>(1_000);
+        let balance = gov.fund_treasury().unwrap();
+        assert_eq!(balance, 1_000);
+        assert_eq!(gov.get_treasury_balance(), 1_000);
+
+        // Zero-value funding is rejected.
+        set_caller(accounts.alice);
+        ink::env::test::set_value_transferred::<ink::env::DefaultEnvironment>(0);
+        assert_eq!(gov.fund_treasury(), Err(Error::InvalidAmount));
+
+        // Only the admin may change the spend limit.
+        set_caller(accounts.bob);
+        assert_eq!(gov.set_treasury_spend_limit(500), Err(Error::Unauthorized));
+        set_caller(accounts.alice);
+        assert!(gov.set_treasury_spend_limit(5_000).is_ok());
+        assert_eq!(gov.get_treasury_spend_limit(), 5_000);
+    }
+
+    #[ink::test]
+    fn budget_proposal_validates_amount_and_signer() {
+        let accounts = default_accounts();
+        let mut gov = create_governance();
+
+        set_caller(accounts.alice);
+        assert_eq!(
+            gov.create_budget_proposal(dummy_hash(), accounts.django, 0),
+            Err(Error::InvalidAmount)
+        );
+
+        // Non-signers cannot create budget proposals.
+        set_caller(accounts.django);
+        assert_eq!(
+            gov.create_budget_proposal(dummy_hash(), accounts.django, 1_000),
+            Err(Error::NotASigner)
         );
     }
 
@@ -924,6 +975,118 @@ mod tests {
         assert_eq!(gov.get_delegated_count(accounts.alice), 0);
         assert_eq!(gov.get_delegated_count(accounts.bob), 1);
         assert_eq!(gov.get_delegate_of(accounts.django), Some(accounts.bob));
+    fn budget_proposal_execution_releases_funds_within_spend_limit() {
+        let accounts = default_accounts();
+        let mut gov = create_governance();
+        fund_contract_balance(10_000_000);
+
+        set_caller(accounts.alice);
+        ink::env::test::set_value_transferred::<ink::env::DefaultEnvironment>(10_000_000);
+        gov.fund_treasury().unwrap();
+        gov.set_treasury_spend_limit(3_000_000).unwrap();
+
+        let id = gov
+            .create_budget_proposal(dummy_hash(), accounts.bob, 2_000_000)
+            .unwrap();
+        assert_eq!(gov.get_proposal_payout(id), Some(2_000_000));
+        let proposal = gov.get_proposal(id).unwrap();
+        assert_eq!(proposal.action_type, GovernanceAction::BudgetSpend);
+        assert_eq!(proposal.target, Some(accounts.bob));
+
+        set_caller(accounts.alice);
+        gov.vote(id, true).unwrap();
+        set_caller(accounts.bob);
+        gov.vote(id, true).unwrap();
+        assert_eq!(gov.get_proposal(id).unwrap().status, ProposalStatus::Approved);
+        advance_block(11);
+        set_caller(accounts.alice);
+        gov.execute_proposal(id).unwrap();
+
+        assert_eq!(gov.get_treasury_balance(), 8_000_000);
+        assert_eq!(gov.get_proposal(id).unwrap().status, ProposalStatus::Executed);
+    }
+
+    #[ink::test]
+    fn budget_proposal_execution_denied_when_over_spend_limit() {
+        let accounts = default_accounts();
+let mut gov = create_governance();
+        fund_contract_balance(10_000_000);
+
+        set_caller(accounts.alice);
+        ink::env::test::set_value_transferred::<ink::env::DefaultEnvironment>(10_000_000);
+        gov.fund_treasury().unwrap();
+        gov.set_treasury_spend_limit(1_000_000).unwrap();
+
+        let id = gov
+            .create_budget_proposal(dummy_hash(), accounts.bob, 2_000_000)
+            .unwrap();
+        set_caller(accounts.alice);
+        gov.vote(id, true).unwrap();
+        set_caller(accounts.bob);
+        gov.vote(id, true).unwrap();
+        advance_block(11);
+        set_caller(accounts.alice);
+
+        assert_eq!(gov.execute_proposal(id), Err(Error::ExceedsSpendLimit));
+
+        // The proposal stays approvable and the treasury is untouched.
+        assert_eq!(gov.get_proposal(id).unwrap().status, ProposalStatus::Approved);
+        assert_eq!(gov.get_treasury_balance(), 10_000_000);
+    }
+
+    #[ink::test]
+    fn budget_proposal_execution_denied_when_funds_insufficient() {
+        let accounts = default_accounts();
+        let mut gov = create_governance();
+
+        // A spend limit but no deposited funds.
+        set_caller(accounts.alice);
+        gov.set_treasury_spend_limit(5_000).unwrap();
+
+        let id = gov
+            .create_budget_proposal(dummy_hash(), accounts.bob, 2_000)
+            .unwrap();
+        set_caller(accounts.alice);
+        gov.vote(id, true).unwrap();
+        set_caller(accounts.bob);
+        gov.vote(id, true).unwrap();
+        advance_block(11);
+        set_caller(accounts.alice);
+
+        assert_eq!(
+            gov.execute_proposal(id),
+            Err(Error::InsufficientTreasuryFunds)
+        );
+        assert_eq!(gov.get_treasury_balance(), 0);
+    }
+
+    #[ink::test]
+    fn emergency_override_execute_releases_budget_payout() {
+        let accounts = default_accounts();
+        let mut gov = create_governance();
+        fund_contract_balance(10_000_000);
+
+        set_caller(accounts.alice);
+        ink::env::test::set_value_transferred::<ink::env::DefaultEnvironment>(10_000_000);
+        gov.fund_treasury().unwrap();
+        gov.set_treasury_spend_limit(5_000_000).unwrap();
+
+        let id = gov
+            .create_budget_proposal(dummy_hash(), accounts.charlie, 4_000_000)
+            .unwrap();
+        assert_eq!(gov.emergency_override(id, true), Ok(()));
+        assert_eq!(gov.get_proposal(id).unwrap().status, ProposalStatus::Executed);
+        assert_eq!(gov.get_treasury_balance(), 6_000_000);
+
+        // An over-limit override is denied and moves nothing.
+        let id2 = gov
+            .create_budget_proposal(dummy_hash(), accounts.bob, 9_999_999)
+            .unwrap();
+        assert_eq!(
+            gov.emergency_override(id2, true),
+            Err(Error::ExceedsSpendLimit)
+        );
+        assert_eq!(gov.get_treasury_balance(), 6_000_000);
     }
 }
 

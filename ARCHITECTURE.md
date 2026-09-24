@@ -326,6 +326,13 @@ Shared types and macros live in `contracts/traits` and `contracts/lib`,
 which are pure-Rust crates (no `#[ink::contract]`) for easy unit-testing
 and inclusion in Kani proofs.
 
+**Lending pool encoding** — the `LendingPool` struct in
+`contracts/lending/src/lib.rs` stores plain, human-readable fields. The
+experimental bit-packed variant (`packed_pool.rs`, promised Kani proof of
+bit-layout invariants) was **removed** as consciously-deferred wiring
+(#1093): storage-layout and mutational tests cover the live struct, and no
+packed variant is advertised until the migration and proof actually land.
+
 ---
 
 ## 6. Security Model

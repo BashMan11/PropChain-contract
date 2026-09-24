@@ -26,6 +26,14 @@ pub enum Error {
     InvalidDelegationTarget,
     /// The admin rotation target is the current admin or the zero address (Issue #1126).
     InvalidRotationTarget,
+    /// A treasury disbursement exceeds the spend limit (Issue #1122).
+    ExceedsSpendLimit,
+    /// The treasury does not hold enough funds for the disbursement (Issue #1122).
+    InsufficientTreasuryFunds,
+    /// The proposed amount is zero or otherwise unusable (Issue #1122).
+    InvalidAmount,
+    /// The native transfer for a treasury disbursement failed (Issue #1122).
+    TransferFailed,
 }
 
 impl core::fmt::Display for Error {
@@ -53,6 +61,12 @@ impl core::fmt::Display for Error {
             Error::InvalidRotationTarget => {
                 write!(f, "Admin rotation target must differ from the admin and be non-zero")
             }
+            Error::ExceedsSpendLimit => write!(f, "Disbursement exceeds the treasury spend limit"),
+            Error::InsufficientTreasuryFunds => {
+                write!(f, "Treasury funds are insufficient for this disbursement")
+            }
+            Error::InvalidAmount => write!(f, "The requested amount is invalid"),
+            Error::TransferFailed => write!(f, "Transfer of treasury funds failed"),
         }
     }
 }
@@ -82,6 +96,12 @@ impl ContractError for Error {
             Error::InvalidRotationTarget => {
                 governance_codes::GOVERNANCE_INVALID_ROTATION_TARGET
             }
+            Error::ExceedsSpendLimit => governance_codes::GOVERNANCE_EXCEEDS_SPEND_LIMIT,
+            Error::InsufficientTreasuryFunds => {
+                governance_codes::GOVERNANCE_INSUFFICIENT_TREASURY_FUNDS
+            }
+            Error::InvalidAmount => governance_codes::GOVERNANCE_INVALID_AMOUNT,
+            Error::TransferFailed => governance_codes::GOVERNANCE_TRANSFER_FAILED,
         }
     }
 
@@ -109,6 +129,12 @@ impl ContractError for Error {
             Error::InvalidRotationTarget => {
                 "Admin rotation target must differ from the admin and be non-zero"
             }
+            Error::ExceedsSpendLimit => "Disbursement exceeds the treasury spend limit",
+            Error::InsufficientTreasuryFunds => {
+                "Treasury funds are insufficient for this disbursement"
+            }
+            Error::InvalidAmount => "The requested amount is invalid",
+            Error::TransferFailed => "Transfer of treasury funds failed",
         }
     }
 

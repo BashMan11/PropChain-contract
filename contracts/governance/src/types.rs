@@ -17,6 +17,8 @@ pub enum GovernanceAction {
     AddSigner,
     RemoveSigner,
     EmergencyOverride,
+    /// Disburse funds from the governance treasury to a target (Issue #1122).
+    BudgetSpend,
 }
 
 #[derive(

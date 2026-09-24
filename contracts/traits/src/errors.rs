@@ -440,6 +440,16 @@ pub mod governance_codes {
     pub const GOVERNANCE_INVALID_DELEGATION_TARGET: u32 = 8022;
     /// The admin rotation target is invalid (same as admin or zero address) (Issue #1126).
     pub const GOVERNANCE_INVALID_ROTATION_TARGET: u32 = 8020;
+    /// Treasury disbursement exceeds the spend limit (Issue #1122).
+    pub const GOVERNANCE_EXCEEDS_SPEND_LIMIT: u32 = 8015;
+    /// Treasury does not hold enough funds for the disbursement (Issue #1122).
+    pub const GOVERNANCE_INSUFFICIENT_TREASURY_FUNDS: u32 = 8016;
+    /// The disbursement amount is invalid (Issue #1122).
+    pub const GOVERNANCE_INVALID_AMOUNT: u32 = 8017;
+    // 8018-8020 reserved for governance delegation/rotation workstream
+    // (delegation, signer cap, rotation-target errors).
+    /// Native transfer for a treasury disbursement failed (Issue #1122).
+    pub const GOVERNANCE_TRANSFER_FAILED: u32 = 8021;
 }
 
 /// Staking error codes (9000-9999)
