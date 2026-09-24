@@ -22,8 +22,10 @@ use propchain_traits::*;
 mod aggregation;
 
 // Median price cache helpers (compute_median, is_cache_fresh) live in
-// `oracle/src/median_cache.rs`; the aggregation path stores the median of
-// collected source prices and the valuation fallback serves fresh entries.
+// `oracle/src/median_cache.rs`; the aggregation path stores the official
+// consensus valuation and the valuation fallback serves fresh entries.
+// Median math is delegated to `aggregation.rs` (single source of truth,
+// Issue #1102).
 mod median_cache;
 
 /// Property Valuation Oracle Contract
@@ -100,6 +102,11 @@ mod propchain_oracle {
 
         /// Minimum sources required for valuation
         pub min_sources_required: u32,
+
+        /// Minimum distinct-source quorum enforced by `aggregate_prices`
+        /// (Issue #1101). Defaults to 2 so a lone source can never dictate the
+        /// official price unless the admin explicitly lowers the quorum.
+        pub min_source_quorum: u32,
 
         /// Outlier detection threshold (standard deviations)
         outlier_threshold: u32,
@@ -453,6 +460,17 @@ mod propchain_oracle {
         batch_enabled: bool,
     }
 
+    /// Emitted when an individual source fails to produce a usable price so
+    /// outages are observable instead of silently dropped (Issue #1100).
+    #[ink(event)]
+    pub struct SourcePriceFailed {
+        #[ink(topic)]
+        source_id: String,
+        #[ink(topic)]
+        property_id: u64,
+        reason: String,
+    }
+
     // ── Multi-Sig Source Management Events (Issue #495) ──────────────────────
 
     /// Emitted when a multi-sig proposal to add/remove an oracle source is created.
@@ -539,6 +557,7 @@ mod propchain_oracle {
                 comparable_cache: Mapping::default(),
                 max_price_staleness: propchain_traits::constants::DEFAULT_MAX_PRICE_STALENESS,
                 min_sources_required: propchain_traits::constants::DEFAULT_MIN_SOURCES_REQUIRED,
+                min_source_quorum: propchain_traits::constants::DEFAULT_MIN_SOURCES_REQUIRED,
                 outlier_threshold: propchain_traits::constants::DEFAULT_OUTLIER_THRESHOLD,
                 source_reputations: Mapping::default(),
                 source_stakes: Mapping::default(),
@@ -623,7 +642,10 @@ mod propchain_oracle {
             let cache_key = (property_id, "default".to_string());
             if let Some((cached_price, cached_at)) = self.cached_median_prices.get(&cache_key) {
                 let now = self.env().block_timestamp();
-                let ttl = self.cache_ttls.get(&cache_key).unwrap_or(DEFAULT_CACHE_TTL_SECS);
+                let ttl = self
+                    .cache_ttls
+                    .get(&cache_key)
+                    .unwrap_or(DEFAULT_CACHE_TTL_SECS);
                 if median_cache::is_cache_fresh(cached_at as u32, now as u32, ttl as u32) {
                     return Ok(PropertyValuation {
                         property_id,
@@ -636,18 +658,11 @@ mod propchain_oracle {
                 }
             }
 
-            // Otherwise return a zeroed placeholder rather than an error. This
-            // is intentional: unknown property ids resolve to a "no data"
-            // valuation so read paths stay total (asserted by
-            // `test_get_nonexistent_valuation_fails`).
-            Ok(PropertyValuation {
-                property_id,
-                valuation: 0,
-                confidence_score: 0,
-                sources_used: 0,
-                last_updated: self.env().block_timestamp(),
-                valuation_method: ValuationMethod::MarketData,
-            })
+            // No stored valuation and no fresh cached median: signal the
+            // failure instead of returning a zeroed placeholder. A synthetic
+            // zero would be treated as a "fresh" value by downstream
+            // aggregation and pull the median/mean toward $0 (Issue #1100).
+            Err(OracleError::PriceFeedError)
         }
 
         /// Set the cache TTL for a given asset and source class.
@@ -1115,7 +1130,12 @@ mod propchain_oracle {
 
             // Check quorum
             let total_votes = proposal.votes_for.saturating_add(proposal.votes_against);
-            let total_power: u128 = 100_000; // Placeholder for total voting power
+            // Issue #1099: total voting power is derived from the current
+            // on-chain state (the sum of active sources' reputations), so
+            // registering/removing sources or slashing a source's reputation
+            // changes everyone's relative influence instead of the previous
+            // hard-coded 100_000 placeholder.
+            let total_power: u128 = self.total_voting_power();
             let quorum = total_power
                 .saturating_mul(self.governance_params.governance_quorum_bps as u128)
                 / 10_000;
@@ -1175,6 +1195,37 @@ mod propchain_oracle {
             Ok(())
         }
 
+        /// Returns the total oracle voting power, derived from the current
+        /// on-chain state (the sum of active sources' reputations) rather than
+        /// a hard-coded placeholder (Issue #1099).
+        #[ink(message)]
+        pub fn get_total_voting_power(&self) -> u128 {
+            self.total_voting_power()
+        }
+
+        /// Returns a source's normalized influence over oracle governance, in
+        /// basis points (10000 bps = 100% of total power). Returns zero when
+        /// the source is not active or no power exists on-chain.
+        #[ink(message)]
+        pub fn get_source_influence_bps(&self, source_id: String) -> u32 {
+            let total = self.total_voting_power();
+            if total == 0 || !self.active_sources.contains(&source_id) {
+                return 0;
+            }
+            let rep = self.source_reputations.get(&source_id).unwrap_or(500) as u128;
+            (rep.saturating_mul(10_000) / total) as u32
+        }
+
+        /// Sum of the reputations of all active oracle sources.
+        fn total_voting_power(&self) -> u128 {
+            let mut total: u128 = 0;
+            for sid in &self.active_sources {
+                let rep = self.source_reputations.get(sid).unwrap_or(500) as u128;
+                total = total.saturating_add(rep);
+            }
+            total
+        }
+
         /// Update property valuation from oracle sources.
         ///
         /// After aggregating prices, records each responding source's last-report
@@ -1190,7 +1241,11 @@ mod propchain_oracle {
             // Collect prices from all active sources
             let prices = self.collect_prices_from_sources(property_id)?;
 
-            if prices.len() < self.min_sources_required as usize {
+            // ── Source quorum (Issue #1101) ──────────────────────────────────
+            // No price is emitted below the configured distinct-source quorum,
+            // which by default requires at least 2 contributors. Admins may
+            // lower it to 1 (single trusted source) explicitly.
+            if prices.len() < self.min_source_quorum as usize {
                 return Err(OracleError::InsufficientSources);
             }
 
@@ -1201,14 +1256,15 @@ mod propchain_oracle {
             let now = self.env().block_timestamp();
 
             // ── Median Price Cache (median_cache.rs) ────────────────────────
-            // Store the median of the collected source prices so that
-            // `get_property_valuation` can serve a fresh cached value when no
-            // stored valuation exists for a property.
-            let price_values: Vec<u128> = prices.iter().map(|p| p.price).collect();
+            // Store the *official* aggregated consensus so `get_property_valuation`
+            // can serve a fresh cached value when no stored valuation exists and
+            // the cached value always agrees with a fresh aggregation (Issue
+            // #1102). The cache defers to `aggregation::simple_median` whenever
+            // the aggregation mode is Median, keeping a single implementation.
             let cache_key = (property_id, "default".to_string());
-            if let Some(median_price) = median_cache::compute_median(&price_values) {
+            if aggregated_price > 0 {
                 self.cached_median_prices
-                    .insert(&cache_key, &(median_price, now));
+                    .insert(&cache_key, &(aggregated_price, now));
             }
 
             // ── Track per-source participation (Issue #497) ──────────────────
@@ -2099,6 +2155,27 @@ mod propchain_oracle {
             Ok(())
         }
 
+        // ── Issue #1101: Source Quorum Configuration ──────────────────────────────
+
+        /// Configure the minimum distinct-source quorum required before any
+        /// price is emitted (admin only). Must be at least 1. The default is 2,
+        /// so a lone source cannot dictate the official price.
+        #[ink(message)]
+        pub fn set_min_source_quorum(&mut self, quorum: u32) -> Result<(), OracleError> {
+            self.ensure_admin()?;
+            if quorum == 0 {
+                return Err(OracleError::InvalidParameters);
+            }
+            self.min_source_quorum = quorum;
+            Ok(())
+        }
+
+        /// Returns the configured minimum distinct-source quorum.
+        #[ink(message)]
+        pub fn get_min_source_quorum(&self) -> u32 {
+            self.min_source_quorum
+        }
+
         // ── Issue #497: Auto-Slash Configuration ─────────────────────────────
 
         /// Configure automatic slashing parameters (admin only).
@@ -2512,12 +2589,26 @@ mod propchain_oracle {
             for (source_id, source) in &valid_sources {
                 match self.get_price_from_source(source, property_id) {
                     Ok(price_data) => {
-                        if self.is_price_fresh(&price_data) {
+                        if price_data.price == 0 {
+                            // Zero is not a real price point; it would skew
+                            // the aggregate toward $0 (Issue #1100).
+                            self.env().emit_event(SourcePriceFailed {
+                                source_id: source_id.clone(),
+                                property_id,
+                                reason: ink::prelude::string::String::from("ZeroPriceRejected"),
+                            });
+                        } else if self.is_price_fresh(&price_data) {
                             prices.push(price_data);
                             source_updates.push((source_id.clone(), current_block));
                         }
                     }
-                    Err(_) => continue,
+                    Err(_reason) => {
+                        self.env().emit_event(SourcePriceFailed {
+                            source_id: source_id.clone(),
+                            property_id,
+                            reason: ink::prelude::string::String::from("SourceFailed"),
+                        });
+                    }
                 }
             }
 
@@ -2574,13 +2665,30 @@ mod propchain_oracle {
                     // In a real implementation, this would call external price feeds
                     match self.get_price_from_source(&source, property_id) {
                         Ok(price_data) => {
-                            if self.is_price_fresh(&price_data) {
+                            if price_data.price == 0 {
+                                // A zero price is not a real data point; a
+                                // "fresh" zero would drag the aggregate to $0
+                                // (Issue #1100). Report and skip.
+                                self.env().emit_event(SourcePriceFailed {
+                                    source_id: source_id.clone(),
+                                    property_id,
+                                    reason: ink::prelude::string::String::from("ZeroPriceRejected"),
+                                });
+                            } else if self.is_price_fresh(&price_data) {
                                 prices.push(price_data);
                                 // Update last-update timestamp
                                 self.last_source_update.insert(source_id, &current_block);
                             }
                         }
-                        Err(_) => continue, // Skip failed sources
+                        Err(_reason) => {
+                            // Report the outage instead of silently dropping it.
+                            self.env().emit_event(SourcePriceFailed {
+                                source_id: source_id.clone(),
+                                property_id,
+                                reason: ink::prelude::string::String::from("SourceFailed"),
+                            });
+                            continue; // Skip failed sources
+                        }
                     }
                 }
             }
@@ -2727,7 +2835,12 @@ mod propchain_oracle {
         }
 
         pub fn aggregate_prices(&self, prices: &[PriceData]) -> Result<u128, OracleError> {
-            if prices.len() < self.min_sources_required as usize {
+            // Issue #1101: enforce the configurable distinct-source quorum
+            // (default 2, admin-lowerable) before any price may be emitted.
+            // `filter_outliers` is not a substitute: it returns samples with
+            // fewer than 3 sources unchanged, so without this gate a lone
+            // source would dictate the official value.
+            if prices.len() < self.min_source_quorum as usize {
                 return Err(OracleError::InsufficientSources);
             }
 
