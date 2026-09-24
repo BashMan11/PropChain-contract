@@ -222,7 +222,7 @@ mod propchain_oracle {
         /// This reduces storage reads during aggregation
         packed_source_weights: Vec<u64>,
 
-        // ── Median Price Cache (Issue #XXX) ───────────────────────────────────
+        // ── Median Price Cache (Issue #812) ───────────────────────────────────
         /// Cached median prices: (asset_id, source_class) -> (price, timestamp)
         cached_median_prices: Mapping<(u64, String), (u128, u64)>,
         /// Per-asset, per-source-class TTL for the cache (in seconds)

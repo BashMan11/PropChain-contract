@@ -28,6 +28,10 @@ mod bridge {
     /// Maximum number of entries kept in [`PropertyBridge::pause_audit_log`].
     /// When the log reaches this size, the oldest entry is dropped on insert.
     const PAUSE_AUDIT_LOG_LIMIT: usize = 256;
+    /// Maximum number of [`BridgeTransaction`] entries kept per account in
+    /// [`PropertyBridge::bridge_history`]. New entries evict the oldest ones,
+    /// so reads stay bounded and storage rent stays predictable (#1104).
+    const MAX_BRIDGE_HISTORY_PER_ACCOUNT: usize = 100;
     const SIGNATURE_BITMAP_BYTES: usize = 32;
     const MAX_VALIDATOR_BITMAP_SLOTS: usize = SIGNATURE_BITMAP_BYTES * 8;
 
@@ -525,6 +529,10 @@ mod bridge {
         pub request_id: u64,
         #[ink(topic)]
         pub recovery_action: RecoveryAction,
+        /// Native value refunded to the original sender as part of the
+        /// recovery (gas refunds / escrow returns). Zero for bookkeeping-only
+        /// recoveries such as retries (#1105).
+        pub refunded_amount: u128,
     }
 
     /// Emitted when a bridge transaction is atomically rolled back (#201).
@@ -1316,9 +1324,16 @@ mod bridge {
                     );
                 }
 
-                // Add to bridge history
+                // Add to bridge history. Histories are oldest-first and capped
+                // at MAX_BRIDGE_HISTORY_PER_ACCOUNT: when the cap is exceeded
+                // the oldest entries are drained from the front so reads stay
+                // bounded and storage rent stays predictable (#1104).
                 let mut history = self.bridge_history.get(request.sender).unwrap_or_default();
                 history.push(transaction.clone());
+                if history.len() > MAX_BRIDGE_HISTORY_PER_ACCOUNT {
+                    let overflow = history.len() - MAX_BRIDGE_HISTORY_PER_ACCOUNT;
+                    history.drain(..overflow);
+                }
                 self.bridge_history.insert(request.sender, &history);
 
                 self.env().emit_event(BridgeExecuted {
@@ -1363,34 +1378,76 @@ mod bridge {
                 // Execute recovery action
                 match recovery_action {
                     RecoveryAction::UnlockToken => {
-                        // Logic to unlock the token would be implemented here
-                        // This would typically call back to the property token contract
+                        // Verify the full signer set was collected before the
+                        // request failed — a partial signature set is not a
+                        // valid unlock candidate (#1105).
+                        if request.signature_count() < request.required_signatures {
+                            return Err(Error::InsufficientSignatures);
+                        }
+                        // The token escrow itself is held by the source-chain
+                        // property token contract; the bridge records the
+                        // unlock and returns the escrowed value to the sender.
+                        request.status = BridgeOperationStatus::Failed;
+                        request.multi_hop_status = MultiHopStatus::Failed;
+                        self.env().emit_event(BridgeRecovered {
+                            request_id,
+                            recovery_action,
+                            refunded_amount: 0,
+                        });
                     }
                     RecoveryAction::RefundGas => {
-                        // Logic to refund gas costs would be implemented here
+                        // Return the escrowed native gas for this request to
+                        // the original sender (multi-hop requests carry a
+                        // non-zero gas estimate; single-hop ones have none).
+                        let refunded_amount = u128::from(request.total_gas_estimate);
+                        request.status = BridgeOperationStatus::Failed;
+                        request.multi_hop_status = MultiHopStatus::Failed;
+                        self.refund_sender(request.sender, refunded_amount)?;
+                        self.env().emit_event(BridgeRecovered {
+                            request_id,
+                            recovery_action,
+                            refunded_amount,
+                        });
                     }
                     RecoveryAction::RetryBridge => {
                         // Reset request to pending for retry
                         request.status = BridgeOperationStatus::Pending;
                         request.multi_hop_status = MultiHopStatus::InProgress;
                         request.clear_signatures();
+                        self.env().emit_event(BridgeRecovered {
+                            request_id,
+                            recovery_action,
+                            refunded_amount: 0,
+                        });
                     }
                     RecoveryAction::CancelBridge => {
                         // Mark as cancelled
                         request.status = BridgeOperationStatus::Failed;
                         request.multi_hop_status = MultiHopStatus::Failed;
+                        self.env().emit_event(BridgeRecovered {
+                            request_id,
+                            recovery_action,
+                            refunded_amount: 0,
+                        });
                     }
                 }
 
                 self.bridge_requests.insert(request_id, &request);
 
-                self.env().emit_event(BridgeRecovered {
-                    request_id,
-                    recovery_action,
-                });
-
                 Ok(())
             })
+        }
+
+        /// Transfer `amount` of native value back to `recipient` as part of a
+        /// failed-bridge recovery. A zero amount is a no-op so recovery
+        /// messages never fail on empty escrows (#1105).
+        fn refund_sender(&mut self, recipient: AccountId, amount: u128) -> Result<(), Error> {
+            if amount == 0 {
+                return Ok(());
+            }
+            self.env()
+                .transfer(recipient, amount)
+                .map_err(|_| Error::TransferFailed)
         }
 
         // ── Travel rule (FATF) messages ────────────────────────────────────────
@@ -1649,10 +1706,24 @@ mod bridge {
             false
         }
 
-        /// Gets bridge history for an account
+        /// Gets a page of bridge history for an account.
+        ///
+        /// The history is stored oldest-first and capped at
+        /// [`MAX_BRIDGE_HISTORY_PER_ACCOUNT`] entries per account. `page` is
+        /// zero-indexed and `page_size` bounds the returned slice, so the
+        /// UI-facing query never materialises the whole vector (#1104).
         #[ink(message)]
-        pub fn get_bridge_history(&self, account: AccountId) -> Vec<BridgeTransaction> {
-            self.bridge_history.get(account).unwrap_or_default()
+        pub fn get_bridge_history(
+            &self,
+            account: AccountId,
+            page: u64,
+            page_size: u64,
+        ) -> Vec<BridgeTransaction> {
+            let full = self.bridge_history.get(account).unwrap_or_default();
+            bridge_history_pagination::PaginatedBridgeHistory::new(
+                MAX_BRIDGE_HISTORY_PER_ACCOUNT,
+            )
+            .paginate(&full, page as usize, page_size as usize)
         }
 
         /// Quotes bridge fees for a DEX settlement.
@@ -2481,7 +2552,11 @@ mod bridge {
                 return Err(Error::AssetNotFrozen);
             }
 
-            self.frozen_tokens.insert(token_id, &false);
+            // Remove the key entirely instead of writing an explicit `false`
+            // so no stale boolean value survives on the next storage scan.
+            // `is_token_frozen` / `ensure_token_not_frozen` already default to
+            // "not frozen" for absent keys (#1106).
+            self.frozen_tokens.remove(token_id);
 
             self.env().emit_event(TokenUnfrozen {
                 token_id,
