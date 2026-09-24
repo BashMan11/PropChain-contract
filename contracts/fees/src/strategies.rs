@@ -26,10 +26,9 @@ impl FeeStrategy for DynamicStrategy {
         let total_multiplier_bp = 10_000u128
             .saturating_add(congestion_bp)
             .saturating_add(demand_bp as u128);
-        let fee = config
-            .base_fee
-            .saturating_mul(total_multiplier_bp)
-            .saturating_div(BASIS_POINTS);
+        // Round the fee UP so the contract never under-collects from the
+        // fraction lost by basis-point division (Issue #1119).
+        let fee = round_fee_up(config.base_fee, total_multiplier_bp, BASIS_POINTS);
         fee.clamp(config.min_fee, config.max_fee)
     }
 }
@@ -44,10 +43,8 @@ impl FeeStrategy for TieredStrategy {
             FeeOperation::PremiumListingBid => 25000, // 2.5x
             _ => 10000,                             // 1x
         };
-        let fee = config
-            .base_fee
-            .saturating_mul(multiplier_bp)
-            .saturating_div(BASIS_POINTS);
+        // Round the fee UP for collection (Issue #1119).
+        let fee = round_fee_up(config.base_fee, multiplier_bp, BASIS_POINTS);
         fee.clamp(config.min_fee, config.max_fee)
     }
 }
@@ -59,13 +56,11 @@ impl FeeStrategy for ExponentialStrategy {
         let congestion_sq = c.saturating_mul(c); // 0 to 10000
         let exp_factor_bp = congestion_sq
             .saturating_mul(config.congestion_sensitivity as u128)
-            .saturating_div(100); 
-        
+            .saturating_div(100);
+
         let total_multiplier_bp = 10_000u128.saturating_add(exp_factor_bp);
-        let fee = config
-            .base_fee
-            .saturating_mul(total_multiplier_bp)
-            .saturating_div(BASIS_POINTS);
+        // Round the fee UP for collection (Issue #1119).
+        let fee = round_fee_up(config.base_fee, total_multiplier_bp, BASIS_POINTS);
         fee.clamp(config.min_fee, config.max_fee)
     }
 }

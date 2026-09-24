@@ -279,11 +279,14 @@ fn liquidation_enforces_threshold_and_leaves_consistent_state() {
     let mut contract = PropertyLending::new(accounts.alice);
     let loan_id = setup_active_loan(&mut contract, &accounts);
 
-    // Healthy market: debt/current LTV stays far below the threshold.
+    // Healthy market: debt/current LTV stays far below the threshold. The
+    // liquidation message prices collateral via the oracle feed (Issue #1088);
+    // caller-supplied values are ignored.
     assert_eq!(
         contract.should_liquidate_loan(loan_id, vec![(10, 2_000_000)]),
         Ok(false)
     );
+    contract.set_oracle_price(10, 2_000_000).unwrap();
     assert_eq!(
         contract.liquidate_loan(loan_id, vec![(10, 2_000_000)]),
         Err(LendingError::LiquidationThresholdNotMet)
@@ -291,6 +294,7 @@ fn liquidation_enforces_threshold_and_leaves_consistent_state() {
 
     // Collateral collapse: 500k debt against 500k value => 10_000 bps LTV,
     // above the 8_000 bps threshold. Both view and message agree.
+    contract.set_oracle_price(10, 500_000).unwrap();
     assert_eq!(
         contract.should_liquidate_loan(loan_id, vec![(10, 500_000)]),
         Ok(true)

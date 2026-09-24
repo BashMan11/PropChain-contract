@@ -1,7 +1,8 @@
 //! Closes #803: public `compute_borrow_rate` view so off-chain tools can
-//! quote without simulating contract state. Starter pure function using a
-//! simple linear model; wiring as a public contract message + docs formula
-//! is a follow-up.
+//! quote without simulating contract state. Wired into `propchain_lending`
+//! (#1091): the `borrow_rate` message and the pool-level interest accrual in
+//! `deposit`/`borrow` both use this linear model, documented in the message
+//! docs as `rate_bps = 200 + 1000 × utilisation_bps / 10 000`.
 
 const BASE_RATE_BPS: u32 = 200; // 2%
 const SLOPE_BPS: u32 = 1_000; // +10% at 100% utilisation

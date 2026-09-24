@@ -1,10 +1,24 @@
-#[derive(Debug, PartialEq)]
+// Standalone `Treasury` helper (Issue #982), wired into the governance
+// contract in #1122. The types are SCALE/StorageLayout compatible so a
+// `Treasury` can live directly in the `#[ink(storage)]` struct while still
+// being unit-testable as a plain module.
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, scale::Encode, scale::Decode)]
+#[cfg_attr(
+    feature = "std",
+    derive(scale_info::TypeInfo, ink::storage::traits::StorageLayout)
+)]
 pub enum TreasuryError {
     NotApproved,
     ExceedsSpendLimit,
     InsufficientFunds,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, scale::Encode, scale::Decode)]
+#[cfg_attr(
+    feature = "std",
+    derive(scale_info::TypeInfo, ink::storage::traits::StorageLayout)
+)]
 pub struct Treasury {
     balance: u128,
     spend_limit: u128,
@@ -23,8 +37,17 @@ impl Treasury {
     pub fn balance(&self) -> u128 {
         self.balance
     }
+    pub fn spend_limit(&self) -> u128 {
+        self.spend_limit
+    }
+    pub fn set_spend_limit(&mut self, new_limit: u128) {
+        self.spend_limit = new_limit;
+    }
 
-    pub fn release(&mut self, approved: bool, amount: u128) -> Result<u128, TreasuryError> {
+    /// Non-mutating feasibility check for `release`; lets callers verify the
+    /// spend-limit and balance constraints before any state is touched, so a
+    /// failed disbursement cannot leave the ledger half-committed.
+    pub fn can_release(&self, approved: bool, amount: u128) -> Result<(), TreasuryError> {
         if !approved {
             return Err(TreasuryError::NotApproved);
         }
@@ -34,6 +57,11 @@ impl Treasury {
         if amount > self.balance {
             return Err(TreasuryError::InsufficientFunds);
         }
+        Ok(())
+    }
+
+    pub fn release(&mut self, approved: bool, amount: u128) -> Result<u128, TreasuryError> {
+        self.can_release(approved, amount)?;
         self.balance = self.balance.saturating_sub(amount);
         Ok(amount)
     }
