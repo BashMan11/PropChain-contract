@@ -91,17 +91,9 @@ pub enum Error {
     AssetNotFrozen,
     /// Insufficient emergency signatures.
     InsufficientEmergencySignatures,
-
-    // ── Validator economics (#1109) ──────────────────────────────────────────
-    /// The collected signatures do not carry enough staked weight to meet
-    /// the staked-weight quorum.
-    InsufficientStakeWeight,
-    /// A validator flip-flopped its vote on a request and was slashed.
-    VoteConflict,
-
-    // ── Governance / configuration (#1107) ───────────────────────────────────
-    /// The proposed rate-limit configuration is invalid.
-    InvalidRateLimit,
+    /// An outgoing native-value transfer (e.g. a gas refund during
+    /// [`RecoveryAction::RefundGas`]) could not be executed.
+    TransferFailed,
 }
 
 impl Error {
@@ -213,9 +205,7 @@ impl ContractError for Error {
             Error::AssetAlreadyFrozen => bridge_codes::BRIDGE_INVALID_REQUEST,
             Error::AssetNotFrozen => bridge_codes::BRIDGE_INVALID_REQUEST,
             Error::InsufficientEmergencySignatures => bridge_codes::BRIDGE_INSUFFICIENT_SIGNATURES,
-            Error::InsufficientStakeWeight => bridge_codes::BRIDGE_INSUFFICIENT_SIGNATURES,
-            Error::VoteConflict => bridge_codes::BRIDGE_INVALID_REQUEST,
-            Error::InvalidRateLimit => bridge_codes::BRIDGE_INVALID_REQUEST,
+            Error::TransferFailed => bridge_codes::BRIDGE_TRANSFER_FAILED,
         }
     }
 
@@ -275,14 +265,8 @@ impl ContractError for Error {
             Error::InsufficientEmergencySignatures => {
                 "Not enough emergency signatures collected for the operation"
             }
-            Error::InsufficientStakeWeight => {
-                "Not enough staked weight collected to meet the approval quorum"
-            }
-            Error::VoteConflict => {
-                "Conflicting vote detected; the signer has been slashed"
-            }
-            Error::InvalidRateLimit => {
-                "The proposed rate-limit configuration is invalid"
+            Error::TransferFailed => {
+                "The native-value transfer for this bridge recovery could not be executed"
             }
         }
     }
