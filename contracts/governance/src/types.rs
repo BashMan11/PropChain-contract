@@ -125,6 +125,34 @@ pub struct DelegationInfo {
     pub expires_at: Option<u64>,
 }
 
+// ── Emergency Override Types (Issue #1125) ──────────────────────────────────
+
+/// A pending emergency override awaiting its grace period before it takes
+/// effect. The two-step flow (implemented by `emergency_override` →
+/// `confirm_emergency_override`) mirrors the admin-rotation cooldown so a stale
+/// or mistaken override can be cancelled rather than instantly finalizing a
+/// proposal.
+#[derive(
+    Debug,
+    Clone,
+    PartialEq,
+    Eq,
+    scale::Encode,
+    scale::Decode,
+    ink::storage::traits::StorageLayout,
+)]
+#[cfg_attr(feature = "std", derive(scale_info::TypeInfo))]
+pub struct EmergencyOverrideRequest {
+    /// Block the override was requested in.
+    pub requested_at: u64,
+    /// Earliest block the override may be confirmed.
+    pub effective_at: u64,
+    /// Whether the pending override force-executes (true) or rejects (false).
+    pub execute: bool,
+    /// Free-form reason attached to the override request.
+    pub reason: Vec<u8>,
+}
+
 // ── Quadratic Voting Types (Issue #229) ─────────────────────────────────────
 
 /// Quadratic voting configuration for a proposal.

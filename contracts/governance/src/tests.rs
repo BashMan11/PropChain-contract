@@ -227,7 +227,14 @@ mod tests {
         set_caller(accounts.alice);
         gov.create_proposal(dummy_hash(), GovernanceAction::ModifyProperty, None)
             .unwrap();
-        gov.emergency_override(0, true).unwrap();
+        gov.emergency_override(0, true, b"admin emergency".to_vec())
+            .unwrap();
+        assert!(
+            gov.get_emergency_override_request(0).is_some(),
+            "override must be pending during grace"
+        );
+        advance_block(20);
+        gov.confirm_emergency_override(0).unwrap();
         let proposal = gov.get_proposal(0).unwrap();
         assert_eq!(proposal.status, ProposalStatus::Executed);
     }
@@ -646,12 +653,16 @@ mod tests {
         // p3: emergency-rejected straight from Active.
         let p3 = gov.create_proposal(dummy_hash(), GovernanceAction::SaleApproval, None).unwrap();
         set_caller(accounts.alice); // admin-only
-        gov.emergency_override(p3, false).unwrap();
+        gov.emergency_override(p3, false, b"reject".to_vec()).unwrap();
+        advance_block(21);
+        gov.confirm_emergency_override(p3).unwrap();
         assert_analytics_match_recount(&gov);
 
         // p4: emergency-executed from Active.
         let p4 = gov.create_proposal(dummy_hash(), GovernanceAction::SaleApproval, None).unwrap();
-        gov.emergency_override(p4, true).unwrap();
+        gov.emergency_override(p4, true, b"execute".to_vec()).unwrap();
+        advance_block(21);
+        gov.confirm_emergency_override(p4).unwrap();
         assert_analytics_match_recount(&gov);
 
         // p5: approved but never executed (stays in Approved/timelock state).
@@ -665,7 +676,9 @@ mod tests {
         // Tricky case: emergency-execute an already-rejected proposal.
         // The recount reads final statuses, so p1 moves rejected -> executed.
         set_caller(accounts.alice); // admin-only
-        gov.emergency_override(p1, true).unwrap();
+        gov.emergency_override(p1, true, b"re-open".to_vec()).unwrap();
+        advance_block(21);
+        gov.confirm_emergency_override(p1).unwrap();
         assert_analytics_match_recount(&gov);
 
         // Final sanity snapshot.
@@ -717,6 +730,81 @@ mod tests {
         assert_analytics_match_recount(&gov);
     }
 
+    // ── Issue #1125: two-step emergency override guardrails ─────────────────
+
+    #[ink::test]
+    fn emergency_override_respects_grace_period() {
+        let mut gov = create_governance();
+        let accounts = default_accounts();
+        set_caller(accounts.alice);
+        gov.create_proposal(dummy_hash(), GovernanceAction::ModifyProperty, None)
+            .unwrap();
+
+        gov.emergency_override(0, true, b"soon".to_vec()).unwrap();
+
+        // Attempting to confirm inside the grace window must fail.
+        assert_eq!(gov.confirm_emergency_override(0), Err(Error::TimelockActive));
+
+        // Pending request is still queryable.
+        let pending = gov.get_emergency_override_request(0).unwrap();
+        assert!(pending.execute);
+        assert_eq!(pending.reason, b"soon".to_vec());
+
+        // After the grace period the override can be confirmed.
+        advance_block(20);
+        gov.confirm_emergency_override(0).unwrap();
+        assert_eq!(gov.get_proposal(0).unwrap().status, ProposalStatus::Executed);
+        assert!(gov.get_emergency_override_request(0).is_none());
+    }
+
+    #[ink::test]
+    fn pending_emergency_override_can_be_cancelled() {
+        let mut gov = create_governance();
+        let accounts = default_accounts();
+        set_caller(accounts.alice);
+        gov.create_proposal(dummy_hash(), GovernanceAction::ModifyProperty, None)
+            .unwrap();
+
+        gov.emergency_override(0, true, b"oops".to_vec()).unwrap();
+        gov.cancel_emergency_override(0).unwrap();
+
+        assert!(gov.get_emergency_override_request(0).is_none());
+        // Cancelling is only allowed while the override is still pending.
+        assert_eq!(gov.cancel_emergency_override(0), Err(Error::ProposalNotFound));
+        // Proposal untouched.
+        assert_eq!(gov.get_proposal(0).unwrap().status, ProposalStatus::Active);
+    }
+
+    #[ink::test]
+    fn only_admin_can_request_emergency_override() {
+        let mut gov = create_governance();
+        let accounts = default_accounts();
+        set_caller(accounts.alice);
+        gov.create_proposal(dummy_hash(), GovernanceAction::ModifyProperty, None)
+            .unwrap();
+
+        set_caller(accounts.bob);
+        assert_eq!(
+            gov.emergency_override(0, true, vec![]),
+            Err(Error::Unauthorized)
+        );
+    }
+
+    // ── Issue #1126: admin rotation guardrails ──────────────────────────────
+
+    #[ink::test]
+    fn admin_rotation_rejects_invalid_targets() {
+        let mut gov = create_governance();
+        let accounts = default_accounts();
+        set_caller(accounts.alice);
+
+        assert_eq!(
+            gov.request_admin_rotation(accounts.alice),
+            Err(Error::InvalidRotationTarget)
+        );
+        assert_eq!(
+            gov.request_admin_rotation(AccountId::from([0u8; 32])),
+            Err(Error::InvalidRotationTarget)
     // ========== Treasury & budget proposals (Issue #1122) ==========
 
     /// Seed the contract's own account so native disbursements can succeed and
@@ -772,6 +860,121 @@ mod tests {
     }
 
     #[ink::test]
+    fn admin_rotation_enforces_cooldown_then_switches() {
+        let mut gov = create_governance();
+        let accounts = default_accounts();
+        set_caller(accounts.alice);
+        gov.request_admin_rotation(accounts.bob).unwrap();
+
+        // Cooldown not yet elapsed → confirm fails.
+        set_caller(accounts.bob);
+        assert_eq!(gov.confirm_admin_rotation(), Err(Error::TimelockActive));
+
+        // After the cooldown (and before expiry), bob takes over as admin.
+        advance_block(14_400);
+        gov.confirm_admin_rotation().unwrap();
+        assert_eq!(gov.get_admin(), accounts.bob);
+    }
+
+    // ── Issue #1124: signer cap returns MaxSigners ──────────────────────────
+
+    #[ink::test]
+    fn signer_cap_returns_max_signers() {
+        let accounts = default_accounts();
+        set_caller(accounts.alice);
+        let mut gov = Governance::new(vec![accounts.alice], 1, 10);
+
+        // GOVERNANCE_MAX_SIGNERS = 50 → 49 more to reach the cap.
+        // Start at i=2: [0x01; 32] is the default alice account (a signer).
+        let extra = 49u32;
+        for i in 2..=(extra + 1) {
+            let account = AccountId::from([i as u8; 32]);
+            gov.add_signer(account).unwrap();
+        }
+        assert_eq!(gov.get_signers().len(), 50);
+
+        assert_eq!(
+            gov.add_signer(AccountId::from([0xff; 32])),
+            Err(Error::MaxSigners)
+        );
+    }
+
+    // ── Issue #1123: on-chain delegation registry ───────────────────────────
+
+    #[ink::test]
+    fn delegation_folds_power_into_delegate_vote() {
+        let mut gov = create_governance();
+        let accounts = default_accounts();
+
+        set_caller(accounts.bob);
+        gov.delegate_to(accounts.alice).unwrap();
+        assert_eq!(gov.get_delegate_of(accounts.bob), Some(accounts.alice));
+        assert_eq!(gov.get_delegated_count(accounts.alice), 1);
+        assert_eq!(gov.get_delegated_count(accounts.bob), 0);
+
+        // Alice now votes with weight 2 (1 base + 1 delegator).
+        set_caller(accounts.alice);
+        gov.create_proposal(dummy_hash(), GovernanceAction::ModifyProperty, None)
+            .unwrap();
+        gov.vote(0, true).unwrap();
+        let proposal = gov.get_proposal(0).unwrap();
+        assert_eq!(proposal.votes_for, 2);
+    }
+
+    #[ink::test]
+    fn delegator_cannot_vote_while_delegated() {
+        let mut gov = create_governance();
+        let accounts = default_accounts();
+        set_caller(accounts.alice);
+        gov.create_proposal(dummy_hash(), GovernanceAction::ModifyProperty, None)
+            .unwrap();
+
+        set_caller(accounts.bob);
+        gov.delegate_to(accounts.alice).unwrap();
+        assert_eq!(gov.vote(0, true), Err(Error::StillDelegated));
+
+        // Undelegating restores direct voting.
+        gov.undelegate().unwrap();
+        assert_eq!(gov.get_delegate_of(accounts.bob), None);
+        assert_eq!(gov.get_delegated_count(accounts.alice), 0);
+        gov.vote(0, true).unwrap();
+        let proposal = gov.get_proposal(0).unwrap();
+        assert_eq!(proposal.votes_for, 1);
+    }
+
+    #[ink::test]
+    fn delegation_requires_valid_targets() {
+        let mut gov = create_governance();
+        let accounts = default_accounts();
+
+        set_caller(accounts.bob);
+        assert_eq!(
+            gov.delegate_to(accounts.bob),
+            Err(Error::InvalidDelegationTarget)
+        );
+        // django is not a signer.
+        assert_eq!(
+            gov.delegate_to(accounts.django),
+            Err(Error::NotASigner)
+        );
+    }
+
+    #[ink::test]
+    fn repointing_delegation_transfers_count() {
+        let mut gov = create_governance();
+        let accounts = default_accounts();
+
+        set_caller(accounts.alice);
+        gov.add_signer(accounts.django).unwrap();
+
+        set_caller(accounts.django);
+        gov.delegate_to(accounts.alice).unwrap();
+
+        set_caller(accounts.django);
+        gov.delegate_to(accounts.bob).unwrap();
+        assert_eq!(gov.get_delegated_count(accounts.alice), 0);
+        assert_eq!(gov.get_delegated_count(accounts.bob), 1);
+        assert_eq!(gov.get_delegate_of(accounts.django), Some(accounts.bob));
     fn budget_proposal_execution_releases_funds_within_spend_limit() {
         let accounts = default_accounts();
         let mut gov = create_governance();

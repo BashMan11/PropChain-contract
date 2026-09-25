@@ -1841,6 +1841,38 @@ mod tests {
         );
     }
 
+    // ── Adoption tests: rate-limit config (#1107) ────────────────────────
+
+    fn new_rate_cfg(max_requests: u64) -> crate::rate_limit_config::RateLimitConfig {
+        crate::rate_limit_config::RateLimitConfig {
+            window_seconds: 86_400,
+            max_requests_per_day: max_requests,
+            max_value_per_day: 1_000_000_000_000_000_000,
+        }
+    }
+
+    #[ink::test]
+    fn rate_limit_config_is_admin_settable_and_enforced() {
+        let mut bridge = setup_bridge();
+        let accounts = test::default_accounts::<DefaultEnvironment>();
+
+        // Non-admin cannot change the rate-limit config.
+        test::set_caller::<DefaultEnvironment>(accounts.bob);
+        assert_eq!(
+            bridge.set_rate_limit_config(new_rate_cfg(1)),
+            Err(Error::Unauthorized)
+        );
+
+        // Admin lowers the per-window request cap to 1.
+        test::set_caller::<DefaultEnvironment>(accounts.alice);
+        bridge.set_rate_limit_config(new_rate_cfg(1)).expect("admin can update");
+        assert_eq!(
+            bridge.get_rate_limit_config().max_requests_per_day,
+            1
+        );
+
+        let metadata = PropertyMetadata {
+            location: String::from("Test"),
     // ── Granular pause tests (Issue #1112) ────────────────────────────────
     //
     // Each test pauses ONE BridgeOperation and proves the matching message
@@ -1854,6 +1886,196 @@ mod tests {
             legal_description: String::from("Test"),
             valuation: 100000,
             documents_url: String::from("ipfs://test"),
+        };
+
+        // First request within the window is allowed.
+        let first = bridge.initiate_bridge_multisig(1, 2, accounts.bob, 2, Some(50), metadata.clone());
+        assert!(first.is_ok());
+
+        // Second request from the same account is rate-limited.
+        let second = bridge.initiate_bridge_multisig(1, 2, accounts.bob, 2, Some(50), metadata);
+        assert_eq!(second, Err(Error::RateLimitExceeded));
+    }
+
+    #[ink::test]
+    fn rate_limit_config_rejects_invalid_values() {
+        let mut bridge = setup_bridge();
+        let accounts = test::default_accounts::<DefaultEnvironment>();
+        test::set_caller::<DefaultEnvironment>(accounts.alice);
+
+        let bad = crate::rate_limit_config::RateLimitConfig {
+            max_requests_per_day: 0,
+            ..crate::rate_limit_config::RateLimitConfig::default()
+        };
+        assert_eq!(bridge.set_rate_limit_config(bad), Err(Error::InvalidRateLimit));
+        // Config unchanged on rejection.
+        assert_eq!(bridge.get_rate_limit_config().max_requests_per_day, 10);
+    }
+
+    // ── Adoption tests: validator staking (#1109) ─────────────────────────
+
+    #[ink::test]
+    fn stake_validator_requires_registered_validator() {
+        let mut bridge = setup_bridge();
+        let accounts = test::default_accounts::<DefaultEnvironment>();
+
+        test::set_caller::<DefaultEnvironment>(accounts.alice);
+        assert_eq!(bridge.stake_validator(10_000_000), Err(Error::Unauthorized));
+
+        bridge.add_validator(accounts.alice).expect("add validator");
+        bridge.stake_validator(10_000_000).expect("stake as validator");
+        assert_eq!(bridge.get_validator_stake(accounts.alice), 10_000_000);
+        assert_eq!(bridge.get_total_staked(), 10_000_000);
+        assert_eq!(bridge.get_slash_pool(), 0);
+
+        // Below-minimum stake is rejected and the ledger is unchanged.
+        assert_eq!(bridge.stake_validator(1), Err(Error::InvalidRequest));
+        assert_eq!(bridge.get_total_staked(), 10_000_000);
+    }
+
+    #[ink::test]
+    fn vote_conflict_slashes_the_signers_stake() {
+        let mut bridge = setup_bridge();
+        let accounts = test::default_accounts::<DefaultEnvironment>();
+
+        test::set_caller::<DefaultEnvironment>(accounts.alice);
+        bridge.add_validator(accounts.alice).expect("add validator");
+
+        let metadata = PropertyMetadata {
+            location: String::from("Test"),
+            size: 1000,
+            legal_description: String::from("Test"),
+            valuation: 500,
+            documents_url: String::from("ipfs://test"),
+        };
+        let request_id = bridge
+            .initiate_bridge_multisig(1, 2, accounts.bob, 2, Some(100), metadata)
+            .expect("initiate");
+
+        bridge.stake_validator(100_000_000).expect("stake validator");
+
+        // Approve, then flip to decline on the same request.
+        test::set_caller::<DefaultEnvironment>(accounts.alice);
+        bridge.sign_bridge_request(request_id, true).expect("approve");
+        let conflict = bridge.sign_bridge_request(request_id, false);
+        assert_eq!(conflict, Err(Error::VoteConflict));
+
+        // 20% of 100_000_000 slashed into the pool; stake reduced.
+        assert_eq!(bridge.get_validator_stake(accounts.alice), 80_000_000);
+        assert_eq!(bridge.get_slash_pool(), 20_000_000);
+    }
+
+    #[ink::test]
+    fn approvals_need_staked_weight_quorum_not_bare_count() {
+        let mut bridge = setup_bridge();
+        let accounts = test::default_accounts::<DefaultEnvironment>();
+
+        test::set_caller::<DefaultEnvironment>(accounts.alice);
+        bridge.add_validator(accounts.alice).expect("validator alice");
+        bridge.add_validator(accounts.bob).expect("validator bob");
+        bridge.add_validator(accounts.charlie).expect("validator charlie");
+        bridge.add_bridge_operator(accounts.alice).expect("operator alice");
+
+        let metadata = PropertyMetadata {
+            location: String::from("Test"),
+            size: 1000,
+            legal_description: String::from("Test"),
+            valuation: 1000,
+            documents_url: String::from("ipfs://test"),
+        };
+        let request_id = bridge
+            .initiate_bridge_multisig(1, 2, accounts.bob, 2, Some(100), metadata)
+            .expect("initiate");
+
+        // Stake makes the required signatures insufficient on their own:
+        // alice(10M) + bob(10M) + charlie(100M) -> total 120M, quorum 72M.
+        test::set_caller::<DefaultEnvironment>(accounts.alice);
+        bridge.stake_validator(10_000_000).expect("stake alice");
+        test::set_caller::<DefaultEnvironment>(accounts.bob);
+        bridge.stake_validator(10_000_000).expect("stake bob");
+        test::set_caller::<DefaultEnvironment>(accounts.charlie);
+        bridge.stake_validator(100_000_000).expect("stake charlie");
+
+        // Two signatures hit the bare required count (2) but only carry 20M
+        // of weight — request must NOT lock.
+        test::set_caller::<DefaultEnvironment>(accounts.alice);
+        bridge.sign_bridge_request(request_id, true).expect("alice signs");
+        test::set_caller::<DefaultEnvironment>(accounts.bob);
+        bridge.sign_bridge_request(request_id, true).expect("bob signs");
+
+        test::set_caller::<DefaultEnvironment>(accounts.alice);
+        assert_eq!(bridge.execute_bridge(request_id), Err(Error::InvalidRequest));
+
+        // Adding charlie's (heavy) signature crosses the quorum and locks.
+        test::set_caller::<DefaultEnvironment>(accounts.charlie);
+        bridge.sign_bridge_request(request_id, true).expect("charlie signs");
+
+        test::set_caller::<DefaultEnvironment>(accounts.alice);
+        bridge.execute_bridge(request_id).expect("locked with quorum");
+    }
+
+    #[ink::test]
+    fn slash_validator_is_admin_only() {
+        let mut bridge = setup_bridge();
+        let accounts = test::default_accounts::<DefaultEnvironment>();
+
+        test::set_caller::<DefaultEnvironment>(accounts.alice);
+        bridge.add_validator(accounts.alice).expect("add validator");
+        bridge.add_validator(accounts.bob).expect("add validator bob");
+        bridge.stake_validator(10_000_000).expect("stake alice");
+        bridge.stake_validator(10_000_000).expect("stake alice again");
+        assert_eq!(bridge.get_validator_stake(accounts.alice), 20_000_000);
+
+        // Non-admin is rejected.
+        test::set_caller::<DefaultEnvironment>(accounts.bob);
+        assert_eq!(
+            bridge.slash_validator(accounts.alice),
+            Err(Error::Unauthorized)
+        );
+
+        test::set_caller::<DefaultEnvironment>(accounts.alice);
+        let penalty = bridge.slash_validator(accounts.alice).expect("admin slashes");
+        assert_eq!(penalty, 4_000_000);
+        assert_eq!(bridge.get_validator_stake(accounts.alice), 16_000_000);
+        assert_eq!(bridge.get_slash_pool(), 4_000_000);
+    }
+
+    // ── Adoption tests: bounded modules (#1110) ───────────────────────────
+
+    #[ink::test]
+    fn audit_log_is_bounded_and_queryable() {
+        let mut bridge = setup_bridge();
+        let accounts = test::default_accounts::<DefaultEnvironment>();
+
+        test::set_caller::<DefaultEnvironment>(accounts.alice);
+        bridge.set_emergency_pause(true).expect("pause");
+        bridge.set_emergency_pause(false).expect("unpause");
+
+        let logs = bridge.get_audit_logs();
+        assert_eq!(logs.len(), 2);
+        assert!(logs[0].paused);
+        assert!(!logs[1].paused);
+    }
+
+    #[ink::test]
+    fn validator_registry_is_capped_by_bitmap_proof() {
+        let mut bridge = setup_bridge();
+        let accounts = test::default_accounts::<DefaultEnvironment>();
+
+        test::set_caller::<DefaultEnvironment>(accounts.alice);
+        for i in 0..100 {
+            let mut bytes = [0u8; 32];
+            bytes[31] = (i + 1) as u8;
+            bridge
+                .add_validator(AccountId::from(bytes))
+                .expect("validator added within cap");
+        }
+        assert_eq!(bridge.get_validators().len(), 100);
+
+        // The 101st validator exceeds the proven 100-slot bitmap bound.
+        let extra = AccountId::from([0xffu8; 32]);
+        assert_eq!(bridge.add_validator(extra), Err(Error::InsufficientSignatures));
+        assert_eq!(bridge.get_validators().len(), 100);
         }
     }
 
