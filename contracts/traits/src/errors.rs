@@ -336,6 +336,7 @@ pub mod bridge_codes {
     pub const BRIDGE_NOT_GUARDIAN: u32 = 3018;
     pub const BRIDGE_TRAVEL_RULE_DATA_REQUIRED: u32 = 3019;
     pub const BRIDGE_TRAVEL_RULE_DATA_ALREADY_SUBMITTED: u32 = 3020;
+    pub const BRIDGE_TRANSFER_FAILED: u32 = 3021;
 }
 
 /// Oracle error codes (4000-4999)
@@ -432,6 +433,14 @@ pub mod governance_codes {
     pub const GOVERNANCE_PROPOSAL_EXPIRED: u32 = 8013;
     /// Signer roster changes are blocked while proposals are actively voting.
     pub const GOVERNANCE_SIGNER_CHANGES_LOCKED: u32 = 8014;
+    /// Signer roster is at its configured maximum (Issue #1124).
+    pub const GOVERNANCE_MAX_SIGNERS: u32 = 8018;
+    /// A delegator cannot vote directly while their delegation is active (Issue #1123).
+    pub const GOVERNANCE_STILL_DELEGATED: u32 = 8019;
+    /// Self-delegation is not allowed (Issue #1123).
+    pub const GOVERNANCE_INVALID_DELEGATION_TARGET: u32 = 8022;
+    /// The admin rotation target is invalid (same as admin or zero address) (Issue #1126).
+    pub const GOVERNANCE_INVALID_ROTATION_TARGET: u32 = 8020;
     /// Treasury disbursement exceeds the spend limit (Issue #1122).
     pub const GOVERNANCE_EXCEEDS_SPEND_LIMIT: u32 = 8015;
     /// Treasury does not hold enough funds for the disbursement (Issue #1122).

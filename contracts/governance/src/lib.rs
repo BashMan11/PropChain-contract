@@ -118,6 +118,49 @@ pub mod governance {
         pub proposal_id: u64,
         #[ink(topic)]
         pub admin: AccountId,
+        pub executed: bool,
+        /// Free-form reason the override was applied (Issue #1125).
+        pub reason: Vec<u8>,
+    }
+
+    /// Emitted when an emergency override is requested but not yet confirmed.
+    #[ink(event)]
+    pub struct EmergencyOverrideRequested {
+        #[ink(topic)]
+        pub proposal_id: u64,
+        #[ink(topic)]
+        pub admin: AccountId,
+        pub execute: bool,
+        pub effective_at: u64,
+        /// Free-form reason attached to the override request (Issue #1125).
+        pub reason: Vec<u8>,
+    }
+
+    /// Emitted when an admin rotation is requested (Issue #1126).
+    #[ink(event)]
+    pub struct AdminRotationRequested {
+        #[ink(topic)]
+        pub old_admin: AccountId,
+        #[ink(topic)]
+        pub new_admin: AccountId,
+        pub effective_at: u32,
+    }
+
+    /// Emitted when a signer delegates their voting power (Issue #1123).
+    #[ink(event)]
+    pub struct Delegated {
+        #[ink(topic)]
+        pub delegator: AccountId,
+        #[ink(topic)]
+        pub delegate: AccountId,
+        pub delegated_at: u64,
+    }
+
+    /// Emitted when a signer terminates their delegation (Issue #1123).
+    #[ink(event)]
+    pub struct Undelegated {
+        #[ink(topic)]
+        pub delegator: AccountId,
     }
 
     /// Emitted when the treasury is funded (Issue #1122).
@@ -237,6 +280,14 @@ pub mod governance {
         // ── Discussion Forum (Issue #233) ───────────────────────────────────────
         /// Comments/discussion for each proposal
         proposal_comments: Mapping<u64, Vec<DiscussionComment>>,
+        // ── Delegation (Issue #1123) ────────────────────────────────────────────
+        /// Active delegation: delegator -> delegate.
+        delegations: Mapping<AccountId, AccountId>,
+        /// Number of delegators currently delegating to each delegate.
+        delegated_counts: Mapping<AccountId, u32>,
+        // ── Emergency override guardrails (Issue #1125) ─────────────────────────
+        /// Pending (not yet confirmed) emergency overrides awaiting grace.
+        emergency_override_requests: Mapping<u64, EmergencyOverrideRequest>,
         // ── Treasury (Issue #1122) ──────────────────────────────────────────────
         /// Governable treasury: holds deposited funds and enforces a spend limit.
         treasury: treasury::Treasury,
@@ -288,6 +339,9 @@ pub mod governance {
                 reveal_phase_started: Mapping::default(),
                 reveal_phase_duration: 10_800, // ~18 hours at 6s blocks
                 proposal_comments: Mapping::default(),
+                delegations: Mapping::default(),
+                delegated_counts: Mapping::default(),
+                emergency_override_requests: Mapping::default(),
                 treasury: treasury::Treasury::new(0, 0),
                 proposal_payouts: Mapping::default(),
             }
@@ -563,10 +617,19 @@ pub mod governance {
         }
 
         /// Casts a vote on an active proposal. Only signers may vote.
+        ///
+        /// Vote weight folds delegation in: a signer with `n` active delegators
+        /// contributes `1 + n` to the tally. Signers with an active delegation
+        /// cannot vote directly — their power is already delegated
+        /// (`Error::StillDelegated`).
         #[ink(message)]
         pub fn vote(&mut self, proposal_id: u64, support: bool) -> Result<(), Error> {
             let caller = self.env().caller();
             self.ensure_signer(caller)?;
+
+            if self.delegations.contains(caller) {
+                return Err(Error::StillDelegated);
+            }
 
             let mut proposal = self
                 .proposals
@@ -582,10 +645,11 @@ pub mod governance {
             }
 
             self.votes.insert((proposal_id, caller), &support);
+            let weight = self.vote_weight(caller);
             if support {
-                proposal.votes_for = proposal.votes_for.saturating_add(1);
+                proposal.votes_for = proposal.votes_for.saturating_add(weight);
             } else {
-                proposal.votes_against = proposal.votes_against.saturating_add(1);
+                proposal.votes_against = proposal.votes_against.saturating_add(weight);
             }
 
             // Check if threshold reached → move to Approved with timelock
@@ -844,7 +908,7 @@ pub mod governance {
             }
 
             if self.signers.len() as u32 >= constants::GOVERNANCE_MAX_SIGNERS {
-                return Err(Error::MaxProposals);
+                return Err(Error::MaxSigners);
             }
 
             self.signers.push(new_signer);
@@ -923,12 +987,94 @@ pub mod governance {
             Ok(())
         }
 
-        /// Emergency override: admin can force-execute or reject a proposal.
+        // ----- Delegation (Issue #1123) -----
+
+        /// Delegates the caller's voting power to `delegate`.
+        ///
+        /// Backed by a Mapping registry (`delegations`/`delegated_counts`), so
+        /// lookups are O(1) instead of the orphaned Vec-linear `delegation.rs`.
+        /// Delegators may not vote directly while a delegation is active
+        /// (`Error::StillDelegated`). Delegating again simply repoints the
+        /// delegation (and decrements the previous delegate's count).
         #[ink(message)]
-        pub fn emergency_override(&mut self, proposal_id: u64, execute: bool) -> Result<(), Error> {
+        pub fn delegate_to(&mut self, delegate: AccountId) -> Result<(), Error> {
+            let caller = self.env().caller();
+            self.ensure_signer(caller)?;
+            self.ensure_signer(delegate)?;
+            if delegate == caller {
+                return Err(Error::InvalidDelegationTarget);
+            }
+
+            if let Some(previous) = self.delegations.get(caller) {
+                if previous == delegate {
+                    return Ok(()); // idempotent
+                }
+                self.decrement_delegation(previous);
+            }
+
+            self.delegations.insert(caller, &delegate);
+            let count = self.delegated_counts.get(delegate).unwrap_or(0);
+            self.delegated_counts
+                .insert(delegate, &count.saturating_add(1));
+
+            self.env().emit_event(Delegated {
+                delegator: caller,
+                delegate,
+                delegated_at: self.env().block_timestamp(),
+            });
+
+            Ok(())
+        }
+
+        /// Terminates the caller's active delegation, dropping their power back
+        /// to the delegate's tally.
+        #[ink(message)]
+        pub fn undelegate(&mut self) -> Result<(), Error> {
+            let caller = self.env().caller();
+            self.ensure_signer(caller)?;
+
+            let delegate = self
+                .delegations
+                .get(caller)
+                .ok_or(Error::ProposalNotFound)?;
+            self.delegations.remove(caller);
+            self.decrement_delegation(delegate);
+
+            self.env().emit_event(Undelegated { delegator: caller });
+
+            Ok(())
+        }
+
+        /// Returns the account the caller has delegated to, if any.
+        #[ink(message)]
+        pub fn get_delegate_of(&self, delegator: AccountId) -> Option<AccountId> {
+            self.delegations.get(delegator)
+        }
+
+        /// Returns the number of delegators currently delegating to `delegate`.
+        #[ink(message)]
+        pub fn get_delegated_count(&self, delegate: AccountId) -> u32 {
+            self.delegated_counts.get(delegate).unwrap_or(0)
+        }
+
+        /// Requests an emergency override of a proposal (Issue #1125).
+        ///
+        /// Two-step flow: this message only records a pending override request
+        /// with a grace period; nothing is finalised until the admin calls
+        /// `confirm_emergency_override` after `effective_at` (or cancels it
+        /// with `cancel_emergency_override`). This gives the signer set a
+        /// recovery window, mirroring the admin-rotation cooldown, so a single
+        /// admin key cannot silently railroad a proposal in one call.
+        #[ink(message)]
+        pub fn emergency_override(
+            &mut self,
+            proposal_id: u64,
+            execute: bool,
+            reason: Vec<u8>,
+        ) -> Result<(), Error> {
             self.ensure_admin()?;
 
-            let mut proposal = self
+            let proposal = self
                 .proposals
                 .get(proposal_id)
                 .ok_or(Error::ProposalNotFound)?;
@@ -939,7 +1085,60 @@ pub mod governance {
                 return Err(Error::ProposalClosed);
             }
 
+            // A new request overwrites any pending one, restarting the grace
+            // window (admin refreshes the notice period).
             let now = self.env().block_number() as u64;
+            let effective_at = now.saturating_add(
+                propchain_traits::constants::GOVERNANCE_EMERGENCY_OVERRIDE_GRACE_BLOCKS,
+            );
+            self.emergency_override_requests.insert(
+                proposal_id,
+                &EmergencyOverrideRequest {
+                    requested_at: now,
+                    effective_at,
+                    execute,
+                    reason: reason.clone(),
+                },
+            );
+
+            self.env().emit_event(EmergencyOverrideRequested {
+                proposal_id,
+                admin: self.env().caller(),
+                execute,
+                effective_at,
+                reason,
+            });
+
+            Ok(())
+        }
+
+        /// Applies a pending emergency override after its grace period elapsed.
+        #[ink(message)]
+        pub fn confirm_emergency_override(&mut self, proposal_id: u64) -> Result<(), Error> {
+            self.ensure_admin()?;
+
+            let request = self
+                .emergency_override_requests
+                .get(proposal_id)
+                .ok_or(Error::ProposalNotFound)?;
+
+            let now = self.env().block_number() as u64;
+            if now < request.effective_at {
+                return Err(Error::TimelockActive);
+            }
+
+            let mut proposal = self
+                .proposals
+                .get(proposal_id)
+                .ok_or(Error::ProposalNotFound)?;
+            if proposal.status == ProposalStatus::Executed
+                || proposal.status == ProposalStatus::Cancelled
+            {
+                self.emergency_override_requests.remove(proposal_id);
+                return Err(Error::ProposalClosed);
+            }
+
+            if request.execute {
             if execute {
                 // Force-execution disburses any budget payout too; a denial
                 // (spend limit / funds) aborts the override (Issue #1122).
@@ -949,21 +1148,51 @@ pub mod governance {
             } else {
                 self.apply_status_transition(&mut proposal, ProposalStatus::Rejected);
             }
-
             self.proposals.insert(proposal_id, &proposal);
+            self.emergency_override_requests.remove(proposal_id);
 
             self.env().emit_event(EmergencyOverrideUsed {
                 proposal_id,
                 admin: self.env().caller(),
+                executed: request.execute,
+                reason: request.reason,
             });
 
             Ok(())
         }
 
+        /// Cancels a pending (not yet confirmed) emergency override.
+        #[ink(message)]
+        pub fn cancel_emergency_override(&mut self, proposal_id: u64) -> Result<(), Error> {
+            self.ensure_admin()?;
+
+            self.emergency_override_requests
+                .get(proposal_id)
+                .ok_or(Error::ProposalNotFound)?;
+            self.emergency_override_requests.remove(proposal_id);
+            Ok(())
+        }
+
+        /// Returns the pending emergency override request for a proposal, if any.
+        #[ink(message)]
+        pub fn get_emergency_override_request(
+            &self,
+            proposal_id: u64,
+        ) -> Option<EmergencyOverrideRequest> {
+            self.emergency_override_requests.get(proposal_id)
+        }
+
         /// Request a two-step admin rotation with cooldown.
+        ///
+        /// Rejects rot[at]ing to the current admin or the zero address
+        /// (`Error::InvalidRotationTarget`) and emits `AdminRotationRequested`
+        /// so a staged takeover is observable to off-chain monitors.
         #[ink(message)]
         pub fn request_admin_rotation(&mut self, new_admin: AccountId) -> Result<(), Error> {
             self.ensure_admin()?;
+            if new_admin == self.admin || new_admin == AccountId::from([0u8; 32]) {
+                return Err(Error::InvalidRotationTarget);
+            }
             let caller = self.env().caller();
             let block = self.env().block_number();
             let effective_at =
@@ -975,6 +1204,12 @@ pub mod governance {
                 requested_at: block,
                 effective_at,
                 confirmed: false,
+            });
+
+            self.env().emit_event(AdminRotationRequested {
+                old_admin: caller,
+                new_admin,
+                effective_at,
             });
 
             Ok(())
@@ -1154,6 +1389,19 @@ pub mod governance {
             Ok(())
         }
 
+        /// Voting weight of `voter`: base 1 plus the number of active delegators.
+        fn vote_weight(&self, voter: AccountId) -> u32 {
+            1u32.saturating_add(self.delegated_counts.get(voter).unwrap_or(0))
+        }
+
+        /// Decrements (and possibly clears) the delegation count for `delegate`.
+        fn decrement_delegation(&mut self, delegate: AccountId) {
+            let count = self.delegated_counts.get(delegate).unwrap_or(0);
+            if count <= 1 {
+                self.delegated_counts.remove(delegate);
+            } else {
+                self.delegated_counts.insert(delegate, &(count - 1));
+            }
         /// Maps a standalone `TreasuryError` onto the contract error surface.
         fn map_treasury_error(e: treasury::TreasuryError) -> Error {
             match e {
@@ -1218,11 +1466,16 @@ pub mod governance {
                 return Err(Error::AlreadyVoted);
             }
 
+            if self.delegations.contains(caller) {
+                return Err(Error::StillDelegated);
+            }
+
             self.votes.insert((proposal_id, caller), &support);
+            let weight = self.vote_weight(caller);
             if support {
-                proposal.votes_for = proposal.votes_for.saturating_add(1);
+                proposal.votes_for = proposal.votes_for.saturating_add(weight);
             } else {
-                proposal.votes_against = proposal.votes_against.saturating_add(1);
+                proposal.votes_against = proposal.votes_against.saturating_add(weight);
             }
 
             // Check if threshold reached → move to Approved with timelock
